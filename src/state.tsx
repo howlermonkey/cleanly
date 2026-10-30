@@ -50,6 +50,7 @@ interface Store {
   scanning: boolean;
   progress: ScanProgress | null;
   lastScanAt: number | null;
+  scanWarnings: Record<string, string>;
 
   cleaning: boolean;
   lastClean: CleanResult | null;
@@ -85,6 +86,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [scanning, setScanning] = useState(false);
   const [progress, setProgress] = useState<ScanProgress | null>(null);
   const [lastScanAt, setLastScanAt] = useState<number | null>(null);
+  const [scanWarnings, setScanWarnings] = useState<Record<string, string>>({});
   const [cleaning, setCleaning] = useState(false);
   const [lastClean, setLastClean] = useState<CleanResult | null>(null);
   const [cleanPulse, setCleanPulse] = useState(0);
@@ -170,7 +172,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         setLastClean(result);
         setCleanPulse((n) => n + 1);
         setLastCleanAt(Date.now());
-        setJunk((prev) => (prev ? prev.map((c) => (ids.includes(c.id) ? { ...c, size: 0, count: 0 } : c)) : prev));
+        setJunk(null);
+        setJunk(await api.scanJunk());
         await refreshDisk();
         return result;
       } catch (e) {
@@ -193,7 +196,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   }, []);
 
   useEffect(() => {
-    const off = api.onProgress(setProgress);
+    const off = api.onProgress(p => {
+      setProgress(p);
+      if (p.warning !== undefined) setScanWarnings(w => ({ ...w, [p.task]: p.warning! }));
+    });
     api.system().then(setSystem).catch(() => undefined);
     api.getSettings().then(setSettingsState).catch(() => undefined);
     void smartScan();
@@ -224,6 +230,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     scanning,
     progress,
     lastScanAt,
+    scanWarnings,
     cleaning,
     lastClean,
     cleanPulse,

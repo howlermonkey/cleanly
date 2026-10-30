@@ -1,3 +1,5 @@
+import { api } from '../api';
+import { useRemovalPreview } from '../components/RemovalPreview';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { JunkCategory } from '../../shared/types';
 import { Icon } from '../components/Icon';
@@ -9,10 +11,9 @@ import './files.css';
 const isPermanent = (c: JunkCategory) => /recycle|trash/i.test(`${c.id} ${c.name}`);
 
 export default function Cleanup() {
-  const { junk, scanning, smartScan, progress, cleaning, cleanJunk, system, settings, toast } = useStore();
+  const { request: previewRemoval, dialog: removalDialog } = useRemovalPreview();
+  const { junk, scanning, smartScan, progress, cleaning, system } = useStore();
   const [selected, setSelected] = useState<Set<string>>(new Set());
-  const [confirming, setConfirming] = useState(false);
-  const [done, setDone] = useState(false);
 
   // scan once on arrival; a failed scan leaves the retry button below instead of looping
   const asked = useRef(false);
@@ -25,14 +26,12 @@ export default function Cleanup() {
   // a fresh scan result resets the selection to the safe categories
   useEffect(() => {
     setSelected(new Set((junk ?? []).filter((c) => c.safe && c.size > 0).map((c) => c.id)));
-    setConfirming(false);
   }, [junk]);
 
   const items = useMemo(() => [...(junk ?? [])].sort((a, b) => Number(b.safe) - Number(a.safe) || b.size - a.size), [junk]);
   const chosen = items.filter((c) => selected.has(c.id) && c.size > 0);
   const total = sum(chosen.map((c) => c.size));
   const files = sum(chosen.map((c) => c.count));
-  const hasPermanent = chosen.some(isPermanent);
   const cleanable = items.filter((c) => c.size > 0);
   const allOn = cleanable.length > 0 && cleanable.every((c) => selected.has(c.id));
   const home = system?.homeDir;
@@ -40,7 +39,6 @@ export default function Cleanup() {
   const cleanProg = progress?.task === 'clean' ? progress : null;
 
   const toggle = (id: string) => {
-    setDone(false);
     setSelected((s) => {
       const n = new Set(s);
       if (n.has(id)) n.delete(id);
@@ -51,31 +49,15 @@ export default function Cleanup() {
 
   const toggleAll = () => setSelected(allOn ? new Set() : new Set(cleanable.map((c) => c.id)));
 
-  const run = async () => {
-    setConfirming(false);
-    const ids = chosen.map((c) => c.id);
-    const result = await cleanJunk(ids);
-    if (!result) return;
-    setDone(true);
-    const extra = result.skipped.length
-      ? ` · ${result.skipped.slice(0, 2).join(', ')}`
-      : result.failed > 0
-        ? ` · ${result.failed} in use, skipped`
-        : '';
-    toast(`Freed ${formatBytes(result.freed)}${extra}`);
-  };
-
-  const start = () => {
-    if (!chosen.length) return;
-    if (settings?.confirmBeforeClean === false) void run();
-    else setConfirming(true);
-  };
+  const run = () => previewRemoval(() => api.previewJunk(chosen.map(c => c.id)));
+  const start = () => { if (chosen.length) void run(); };
 
   const big = splitBytes(total);
 
   return (
     <div className="screen">
-      <ScreenHead title="Cleanup" sub="Caches, temp files and logs your apps rebuild on their own. Safe items are picked for you.">
+      {removalDialog}
+      <ScreenHead title="Cleanup" sub="Inspect cleanup candidates and preview exact paths. Removal is disabled in this development build.">
         <div className="fx-head-actions">
           <button type="button" className="btn small" onClick={() => void smartScan()} disabled={scanning || cleaning}>
             {scanning ? <span className="spinner" /> : <Icon name="scan" />}
@@ -128,7 +110,7 @@ export default function Cleanup() {
             </button>
           </div>
           {cleanable.length === 0 && !scanning ? (
-            <Empty icon="check" title="All clean" text="Nothing to remove right now. Check back in a few days." />
+            <Empty icon="check" title="No candidates found" text="No candidates were found in the inspected locations. Check scan warnings for excluded or unreadable locations." />
           ) : (
             <div className="list fx-list">
               {items.map((c) => {
@@ -155,7 +137,7 @@ export default function Cleanup() {
                           Permanent
                         </span>
                       )}
-                      {!empty && <span className={`tag ${c.safe ? 'safe' : 'review'}`}>{c.safe ? 'Safe' : 'Review'}</span>}
+                      {!empty && <span className={`tag ${c.safe ? 'safe' : 'review'}`}>{c.safe ? 'Suggested' : 'Review'}</span>}
                     </div>
                     <span className="size">{empty ? 'Clean' : formatBytes(c.size)}</span>
                   </label>
@@ -167,27 +149,6 @@ export default function Cleanup() {
       )}
 
       {junk && cleanable.length > 0 && (
-        confirming ? (
-          <div className="fx-dock" role="alertdialog" aria-label="Confirm cleanup">
-            <span className={`chip-ico${hasPermanent ? ' warm' : ''}`}>
-              <Icon name={hasPermanent ? 'warning' : 'broom'} />
-            </span>
-            <div className="grow">
-              <div className="fx-dock-q">Delete {formatBytes(total)} of caches and junk?</div>
-              {hasPermanent ? (
-                <div className="fx-dock-note warn">Includes emptying the Trash. That part can't be undone.</div>
-              ) : (
-                <div className="fx-dock-note">They rebuild themselves when apps need them.</div>
-              )}
-            </div>
-            <button type="button" className="btn ghost" onClick={() => setConfirming(false)}>
-              Cancel
-            </button>
-            <button type="button" className={`btn primary${hasPermanent ? ' danger' : ''}`} onClick={() => void run()} autoFocus>
-              Delete
-            </button>
-          </div>
-        ) : (
           <div className="fx-dock">
             <div className="grow">
               <div className="fx-dock-num">
@@ -202,15 +163,13 @@ export default function Cleanup() {
             </div>
             {cleaning && <Progress value={cleanProg && cleanProg.total > 0 ? cleanProg.done / cleanProg.total : undefined} />}
             <CleanButton
-              label={cleaning ? 'Cleaning' : done && !chosen.length ? 'Done' : 'Clean'}
+              label={cleaning ? 'Working' : 'Preview cleanup'}
               sub={formatBytes(total)}
               busy={cleaning}
-              done={done && !chosen.length}
               disabled={!chosen.length || scanning}
               onClick={start}
             />
           </div>
-        )
       )}
     </div>
   );

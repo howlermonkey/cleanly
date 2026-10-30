@@ -1,3 +1,4 @@
+import { useRemovalPreview } from '../components/RemovalPreview';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import type { DuplicateGroup, IconName } from '../../shared/types';
 import { api } from '../api';
@@ -46,14 +47,14 @@ function scan(): Promise<DuplicateGroup[]> {
 }
 
 export default function Duplicates() {
-  const { progress, system, disks, settings, toast, refreshDisk } = useStore();
+  const { request: previewRemoval, dialog: removalDialog } = useRemovalPreview();
+  const { progress, system, disks, toast } = useStore();
   const [groups, setGroups] = useState<DuplicateGroup[] | null>(cache);
   const [loading, setLoading] = useState(false);
   const [failed, setFailed] = useState(false);
   const [keep, setKeep] = useState<Record<string, string>>({});
   const [skip, setSkip] = useState<Set<string>>(new Set());
   const [limit, setLimit] = useState(PAGE);
-  const [confirming, setConfirming] = useState(false);
   const [trashing, setTrashing] = useState(false);
 
   const home = system?.homeDir;
@@ -109,31 +110,9 @@ export default function Duplicates() {
     api.revealPath(path).catch((e: unknown) => toast(e instanceof Error ? e.message : 'Could not show that file', 'err'));
   };
 
-  const trash = async () => {
-    setConfirming(false);
-    setTrashing(true);
-    const paths = toTrash.map((f) => f.path);
-    try {
-      const result = await api.trashPaths(paths);
-      const moved = result.removed;
-      const note = result.failed > 0 ? ` · ${result.failed} could not be moved` : '';
-      toast(`Moved ${moved} ${moved === 1 ? 'copy' : 'copies'} (${formatBytes(result.freed)}) to Trash${note}`, result.failed && !moved ? 'err' : 'ok');
-      if (result.failed > 0) {
-        await load(true);
-      } else {
-        const gone = new Set(paths);
-        const next = (groups ?? [])
-          .map((g) => ({ ...g, files: g.files.filter((f) => !gone.has(f.path)) }))
-          .filter((g) => g.files.length > 1);
-        cache = next;
-        setGroups(next);
-      }
-      void refreshDisk();
-    } catch (e) {
-      toast(e instanceof Error ? e.message : 'Could not move copies to Trash', 'err');
-    } finally {
-      setTrashing(false);
-    }
+  const trash = async () => { setTrashing(true);
+    try { await previewRemoval(() => api.previewDuplicates((groups ?? []).filter(g => !skip.has(g.hash)).map(g => ({ hash: g.hash, keeper: keeperOf(g), remove: g.files.filter(f => f.path !== keeperOf(g)).map(f => f.path) }))), () => load(true)); }
+    finally { setTrashing(false); }
   };
 
   const icons = useFileIcons((groups ?? []).slice(0, limit).map((g) => g.files[0]?.path));
@@ -144,6 +123,7 @@ export default function Duplicates() {
 
   return (
     <div className="screen">
+      {removalDialog}
       <ScreenHead title="Duplicates" sub="Identical files, matched by content, not by name. We keep the newest copy and move the rest to the Trash.">
         {groups && groups.length > 0 && (
           <div className="fx-stat">
@@ -297,25 +277,7 @@ export default function Duplicates() {
           </div>
 
           {n > 0 &&
-            (confirming ? (
-              <div className="fx-dock" role="alertdialog" aria-label="Confirm move to Trash">
-                <span className="chip-ico">
-                  <Icon name="trash" />
-                </span>
-                <div className="grow">
-                  <div className="fx-dock-q">
-                    Move {n} {n === 1 ? 'copy' : 'copies'} ({formatBytes(trashSize)}) to Trash?
-                  </div>
-                  <div className="fx-dock-note">One copy of each file stays where it is. You can restore the rest from the Trash.</div>
-                </div>
-                <button type="button" className="btn ghost" onClick={() => setConfirming(false)}>
-                  Cancel
-                </button>
-                <button type="button" className="btn primary" onClick={() => void trash()} autoFocus>
-                  Move to Trash
-                </button>
-              </div>
-            ) : (
+            (
               <div className="fx-dock">
                 <div className="grow">
                   <div className="fx-dock-num">
@@ -330,13 +292,13 @@ export default function Duplicates() {
                   type="button"
                   className="btn primary"
                   disabled={trashing || loading}
-                  onClick={() => (settings?.confirmBeforeClean === false ? void trash() : setConfirming(true))}
+                  onClick={() => void trash()}
                 >
                   {trashing ? <span className="spinner" style={{ borderColor: 'rgba(255,255,255,0.35)', borderTopColor: '#fff' }} /> : <Icon name="trash" />}
-                  {trashing ? 'Moving' : `Move ${n} ${n === 1 ? 'copy' : 'copies'} to Trash`}
+                  {trashing ? 'Preparing' : `Preview ${n} ${n === 1 ? 'copy' : 'copies'}`}
                 </button>
               </div>
-            ))}
+            )}
         </>
       )}
     </div>

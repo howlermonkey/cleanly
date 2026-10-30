@@ -128,7 +128,7 @@ function buildContext(ctx: AiContext): { data: Record<string, unknown>; known: S
   return { data, known };
 }
 
-function parseAdvice(raw: unknown, known: Set<string>, provider: AiProvider): AiAdvice {
+export function parseAdvice(raw: unknown, _known: Set<string>, provider: AiProvider): AiAdvice {
   if (!isRecord(raw) || typeof raw.answer !== 'string' || !raw.answer.trim()) {
     throw new Error('The assistant sent an answer Cleanly could not read. Please try again.');
   }
@@ -136,8 +136,8 @@ function parseAdvice(raw: unknown, known: Set<string>, provider: AiProvider): Ai
     .map((s) => {
       const p = text(s.path).trim();
       let verdict: Verdict = VERDICTS.includes(s.verdict as Verdict) ? (s.verdict as Verdict) : 'review';
-      // Never let the model mark something "safe" that Cleanly did not show it.
-      if (verdict === 'safe' && !known.has(p.toLowerCase())) verdict = 'review';
+      // Model output cannot certify deletion safety, even for a path included in its context.
+      if (verdict === 'safe') verdict = 'review';
       return { path: untildify(p), verdict, reason: text(s.reason, 300).trim() };
     })
     .filter((s) => s.path)

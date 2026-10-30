@@ -1,22 +1,24 @@
 {
   "name": "cleanly",
-  "productName": "Cleanly",
+  "productName": "EvenCleaner Development",
   "version": "0.1.1",
-  "description": "A stylish, safe PC cleaner for Windows and macOS",
+  "description": "Development-only cleaner safety review; destructive operations disabled",
   "author": "0xCodez",
   "license": "UNLICENSED",
   "private": true,
   "main": "dist-electron/main.js",
   "type": "module",
   "scripts": {
+    "test": "node --test tests/safety.test.cjs",
+    "check:release": "node scripts/check-release.cjs",
     "dev": "concurrently -k -n vite,main,app \"vite\" \"node scripts/build-electron.mjs --watch\" \"wait-on tcp:5174 file:dist-electron/main.js file:dist-electron/preload.cjs && cross-env VITE_DEV_SERVER_URL=http://localhost:5174 electron .\"",
     "demo": "vite",
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json",
     "build": "npm run typecheck && vite build && node scripts/build-electron.mjs",
     "icons": "node scripts/make-icons.mjs",
-    "dist": "npm run build && electron-builder",
-    "dist:win": "npm run build && electron-builder --win",
-    "dist:mac": "npm run build && electron-builder --mac"
+    "dist": "npm run check:release && npm run build && electron-builder",
+    "dist:win": "npm run check:release && npm run build && electron-builder --win",
+    "dist:mac": "npm run check:release && npm run build && electron-builder --mac"
   },
   "devDependencies": {
     "@anthropic-ai/sdk": "^1.3.0",

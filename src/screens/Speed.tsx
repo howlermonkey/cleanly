@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState, type CSSProperties } from 'react';
 import type { StartupItem } from '../../shared/types';
 import { api } from '../api';
+import { DESTRUCTIVE_FEATURES_ENABLED } from '../../shared/safety';
 import { Icon } from '../components/Icon';
 import { Empty, ScreenHead, Toggle } from '../components/ui';
 import { useFileIcons } from '../lib/useFileIcons';
@@ -221,6 +222,7 @@ export default function Speed() {
                               ) : (
                                 <span title={asks ? askHint : undefined} className="sy-switch">
                                   <Toggle
+                                    disabled={!DESTRUCTIVE_FEATURES_ENABLED}
                                     checked={item.enabled}
                                     label={`Start ${item.name} at login${asks ? ` (${askHint.toLowerCase()})` : ''}`}
                                     onChange={(v) => void toggle(item, v)}

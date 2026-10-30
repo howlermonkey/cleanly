@@ -25,6 +25,7 @@ a { color: var(--blue); }
 a:hover { color: #1a2fb0; }
 ::selection { background: rgba(43, 76, 255, 0.18); }
 :focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
+.safety-notice { padding: 10px 20px; background: #fff3cd; color: #604600; font-size: 13px; flex-shrink: 0; }
 
 /* ---------- icons: duotone = soft fill + crisp outline; custom properties reach <use> clones ---------- */
 .ic { width: 20px; height: 20px; flex: none; --fo: 0.16; --sw: 1.7; --ac: var(--pink); }

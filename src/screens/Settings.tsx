@@ -248,7 +248,7 @@ export default function Settings() {
           ))}
           <p className="sy-privacy" style={{ margin: '8px 0 0' }}>
             <Icon name="shield" />
-            Only file names, paths and sizes are shared — never file contents.
+            Your question, file names, paths, sizes, modification dates and disk summary are shared — never file contents.
           </p>
         </section>
 

@@ -1,9 +1,9 @@
-import { app } from 'electron';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { createReadStream, promises as fs } from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
+import { personalRoots, isPersonalPath } from './personalPolicy';
+import { assertNoLinks } from './pathSafety';
 import type { DuplicateGroup, ScanProgress } from '../../shared/types';
 
 type Progress = (p: ScanProgress) => void;
@@ -24,23 +24,7 @@ const MAX_GROUPS = 200;
 const SKIP_DIRS = new Set(['node_modules', '$recycle.bin', 'system volume information', '__pycache__', 'bower_components']);
 const PACKAGE_EXT = /\.(app|photoslibrary|photolibrary|musiclibrary|tvlibrary|imovielibrary|fcpbundle|logicx|band|aplibrary|lrdata|lrlibrary|bundle|framework|plugin|kext|xcodeproj|xcworkspace|pkg|mpkg|sparsebundle|rtfd|pages|numbers|key|vmwarevm|pvm|utm)$/i;
 
-function scanRoots(): string[] {
-  const home = os.homedir();
-  const names = ['Desktop', 'Documents', 'Downloads', 'Pictures', process.platform === 'darwin' ? 'Movies' : 'Videos', 'Music'];
-  const candidates = names.map((n) => path.join(home, n));
-  // Windows folders are often redirected (e.g. into OneDrive); Electron knows the real locations.
-  for (const key of ['desktop', 'documents', 'downloads', 'pictures', 'videos', 'music'] as const) {
-    try {
-      candidates.push(app.getPath(key));
-    } catch {
-      // Unknown on this system.
-    }
-  }
-  const norm = (p: string) => (process.platform === 'linux' ? path.resolve(p) : path.resolve(p).toLowerCase());
-  const unique = [...new Map(candidates.map((p) => [norm(p), path.resolve(p)])).values()];
-  // Drop roots that sit inside another root so nothing is walked twice.
-  return unique.filter((p) => !unique.some((o) => o !== p && norm(p).startsWith(norm(o) + path.sep)));
-}
+function scanRoots(): string[] { return personalRoots(); }
 
 function throttle(progress: Progress): Progress {
   let last = 0;
@@ -52,19 +36,22 @@ function throttle(progress: Progress): Progress {
   };
 }
 
-async function walk(roots: string[], report: (seen: number, dir: string) => void): Promise<Entry[]> {
+async function walk(roots: string[], report: (seen: number, dir: string) => void): Promise<{ files: Entry[]; incomplete: boolean }> {
+  let incomplete = false;
   const files: Entry[] = [];
   const seenInodes = new Set<string>();
   const queue: string[] = [];
   for (const root of roots) {
     try {
+      await assertNoLinks(root);
       const st = await fs.lstat(root);
       if (st.isDirectory() && !st.isSymbolicLink()) queue.push(root);
     } catch {
-      // Missing root.
+      incomplete = true;
     }
   }
   let seen = 0;
+  let visited = 0;
   let active = 0;
 
   await new Promise<void>((resolve) => {
@@ -73,37 +60,42 @@ async function walk(roots: string[], report: (seen: number, dir: string) => void
         resolve();
         return;
       }
-      while (active < 16 && queue.length > 0 && files.length < MAX_FILES) {
+      while (active < 16 && queue.length > 0 && visited < MAX_FILES) {
         const dir = queue.pop()!;
         active++;
-        visit(dir).finally(() => {
+        visit(dir).catch(() => { incomplete = true; }).finally(() => {
           active--;
           pump();
         });
       }
-      if (files.length >= MAX_FILES && active === 0) resolve();
+      if (visited >= MAX_FILES && active === 0) { incomplete = true; resolve(); }
     };
 
     const visit = async (dir: string) => {
       let names: string[];
       try {
+        await assertNoLinks(dir);
         names = await fs.readdir(dir);
       } catch {
+        incomplete = true;
         return;
       }
       report(seen, dir);
       for (const name of names) {
+        if (visited++ >= MAX_FILES) { incomplete = true; break; }
         if (name.startsWith('.')) continue;
         const full = path.join(dir, name);
+        if (!isPersonalPath(full)) continue;
         // bigint keeps NTFS 64-bit file ids exact; as plain numbers distinct files could share an id.
         let st: import('node:fs').BigIntStats;
         try {
           st = await fs.lstat(full, { bigint: true });
         } catch {
+          incomplete = true;
           continue;
         }
         // lstat reports symlinks and Windows junctions as links; never follow them.
-        if (st.isSymbolicLink()) continue;
+        if (st.isSymbolicLink()) { incomplete = true; continue; }
         if (st.isDirectory()) {
           if (!SKIP_DIRS.has(name.toLowerCase()) && !PACKAGE_EXT.test(name)) queue.push(full);
           continue;
@@ -127,7 +119,7 @@ async function walk(roots: string[], report: (seen: number, dir: string) => void
 
     pump();
   });
-  return files;
+  return { files, incomplete };
 }
 
 /**
@@ -180,6 +172,7 @@ function windowsLocalOnly(entries: Entry[]): Promise<Entry[]> {
 async function partialHash(e: Entry): Promise<string | null> {
   let fh: import('node:fs/promises').FileHandle | null = null;
   try {
+    await assertNoLinks(e.path);
     fh = await fs.open(e.path, 'r');
     const head = Buffer.alloc(EDGE);
     const tail = Buffer.alloc(EDGE);
@@ -193,7 +186,8 @@ async function partialHash(e: Entry): Promise<string | null> {
   }
 }
 
-function fullHash(e: Entry): Promise<string | null> {
+async function fullHash(e: Entry): Promise<string | null> {
+  try { await assertNoLinks(e.path); } catch { return null; }
   return new Promise((resolve) => {
     const hash = createHash('sha256');
     const stream = createReadStream(e.path, { highWaterMark: 1024 * 1024 });
@@ -231,9 +225,10 @@ function groupBy<K>(entries: Entry[], keys: (K | null)[]): [K, Entry[]][] {
 export async function scanDuplicates(progress: Progress): Promise<DuplicateGroup[]> {
   const send = throttle(progress);
   send({ task: 'dupes', phase: 'Looking for files', done: 0, total: 0 });
-  const files = await walk(scanRoots(), (seen, dir) =>
+  const scanned = await walk(scanRoots(), (seen, dir) =>
     send({ task: 'dupes', phase: 'Looking for files', done: seen, total: 0, current: dir }));
 
+  const files = scanned.files;
   // Only files sharing an exact size can be duplicates.
   const bySize = groupBy(files, files.map((f) => f.size));
   const sizeCandidates = await windowsLocalOnly(bySize.flatMap(([, g]) => g));
@@ -262,6 +257,6 @@ export async function scanDuplicates(progress: Progress): Promise<DuplicateGroup
     files: g.map((f) => ({ path: f.path, modified: f.modified })).sort((a, b) => b.modified - a.modified),
   }));
   groups.sort((a, b) => b.size * (b.files.length - 1) - a.size * (a.files.length - 1));
-  progress({ task: 'dupes', phase: 'Done', done: groups.length, total: groups.length });
+  progress({ task: 'dupes', phase: 'Done', done: groups.length, total: groups.length, warning: scanned.incomplete || groups.length > MAX_GROUPS || sizeCandidates.length < bySize.flatMap(([,g]) => g).length || partialKeys.some(k => k === null) || fullKeys.some(k => k === null) ? 'Duplicate results are partial: some files were inaccessible, cloud-only, or excluded by limits.' : '' });
   return groups.slice(0, MAX_GROUPS);
 }

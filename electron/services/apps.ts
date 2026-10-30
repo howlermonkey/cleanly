@@ -1,4 +1,5 @@
 import { shell } from 'electron';
+import { assertDestructiveFeaturesEnabled } from '../../shared/safety';
 import { execFile, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, promises as fs } from 'node:fs';
@@ -397,6 +398,7 @@ export async function listApps(): Promise<InstalledApp[]> {
 }
 
 export async function uninstallApp(id: string): Promise<{ ok: boolean; message: string }> {
+  assertDestructiveFeaturesEnabled();
   if (typeof id !== 'string') return { ok: false, message: 'Invalid request' };
   if (process.platform === 'win32') return uninstallWindows(id);
   if (process.platform === 'darwin') return uninstallMac(id);

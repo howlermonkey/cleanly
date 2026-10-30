@@ -1,21 +1,22 @@
 import { execFile } from 'node:child_process';
+import { assertDestructiveFeaturesEnabled } from '../../shared/safety';
 import { promises as fsp, type Dirent } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import type { CleanResult, IconName, JunkCategory, ScanProgress } from '../../shared/types';
-import { deleteCacheEntry, isSafeUserPath, trashPaths } from './trash';
+import { isSafeUserPath } from './trash';
+import { assertNoLinks } from './pathSafety';
+import { plannedItem, removalPlans, type PlannedItem } from './plans';
+import type { RemovalPlan } from '../../shared/types';
 import {
   DAY_MS,
   displayPath,
-  isInside,
   isRealDir,
   knownFolder,
-  knownFolders,
-  localAppData,
   mapLimit,
-  roamingAppData,
   samePath,
   walk,
+  incompleteWalk,
 } from './walk';
 
 type Progress = (p: ScanProgress) => void;
@@ -53,7 +54,10 @@ async function dirs(paths: string[], exclude?: (p: string) => string[] | undefin
   const out: Root[] = [];
   for (const p of paths) {
     if (out.some((r) => samePath(r.path, p))) continue;
-    if (await isRealDir(p)) out.push({ path: p, exclude: exclude?.(p) });
+    if (await isRealDir(p)) {
+      await assertNoLinks(p);
+      out.push({ path: p, exclude: exclude?.(p) });
+    }
   }
   return out;
 }
@@ -74,7 +78,6 @@ const PROFILE_CACHES = [
   'DawnCache',
   'DawnGraphiteCache',
   'DawnWebGPUCache',
-  path.join('Service Worker', 'CacheStorage'),
   path.join('Service Worker', 'ScriptCache'),
 ];
 const USER_DATA_CACHES = ['GrShaderCache', 'ShaderCache', 'GraphiteDawnCache'];
@@ -97,28 +100,18 @@ async function firefoxCaches(profilesDir: string): Promise<string[]> {
   return (await subdirs(profilesDir)).map((p) => path.join(p, 'cache2'));
 }
 
-/** %TEMP% only if it looks like a real temp folder, never a root, home or user folder. */
-function userTempDir(): string {
-  const fallback = path.join(localAppData(), 'Temp');
-  const t = os.tmpdir();
-  if (samePath(t, fallback)) return t;
-  // A custom TEMP such as Documents\tmp or a project's tmp folder holds the user's own files.
-  const bad =
-    path.parse(t).root === path.resolve(t) ||
-    samePath(t, home()) ||
-    isInside(t, home()) ||
-    Object.values(knownFolders()).some((k) => samePath(k, t) || isInside(t, k) || isInside(k, t)) ||
-    (isInside(home(), t) && !isInside(localAppData(), t)) ||
-    !/^te?mp$/i.test(path.basename(t));
-  return bad ? fallback : t;
+/** Only the conventional per-user temp location is eligible for a development preview. */
+export function userTempDir(): string {
+  // Custom TEMP/LOCALAPPDATA values are not proof that a directory is disposable.
+  return path.join(home(), 'AppData', 'Local', 'Temp');
 }
 
 function winDefs(): Def[] {
-  const L = localAppData();
-  const R = roamingAppData();
+  // Environment overrides do not establish a disposable storage boundary.
+  const L = path.join(home(), 'AppData', 'Local');
+  const R = path.join(home(), 'AppData', 'Roaming');
   const winDir = process.env.SystemRoot || process.env.windir || 'C:\\Windows';
-  const programData = process.env.ProgramData || 'C:\\ProgramData';
-  const appCache = (base: string) => ['Cache', 'Code Cache', 'GPUCache', path.join('Service Worker', 'CacheStorage')].map((c) => path.join(base, c));
+  const appCache = (base: string) => ['Cache', 'Code Cache', 'GPUCache'].map((c) => path.join(base, c));
 
   return [
     {
@@ -201,8 +194,6 @@ function winDefs(): Def[] {
           path.join(L, 'CrashDumps'),
           path.join(L, 'Microsoft', 'Windows', 'WER', 'ReportArchive'),
           path.join(L, 'Microsoft', 'Windows', 'WER', 'ReportQueue'),
-          path.join(programData, 'Microsoft', 'Windows', 'WER', 'ReportArchive'),
-          path.join(programData, 'Microsoft', 'Windows', 'WER', 'ReportQueue'),
         ]),
     },
     {
@@ -393,9 +384,8 @@ function oldDownloadsDef(binName: string): Def {
 }
 
 function platformDefs(): Def[] {
-  if (isWin) return winDefs();
-  if (isMac) return macDefs();
-  return linuxDefs();
+  const defs = isWin ? winDefs() : isMac ? macDefs() : linuxDefs();
+  return defs.filter(d => d.kind !== 'recycle' && !['trash', 'win-update', 'win-system-temp'].includes(d.id));
 }
 
 const lower = (s: string) => s.toLowerCase();
@@ -416,7 +406,7 @@ async function measureCache(def: Def, roots: Root[], onTick: (current: string) =
     const entries = new Set<string>();
     let bytes = 0;
     const top = (p: string) => lower(path.relative(root.path, p).split(path.sep)[0]);
-    await walk(root.path, {
+    const stats = await walk(root.path, {
       maxEntries: SCAN_CAP,
       skipDir: (_p, name, depth) => depth === 1 && excluded.has(lower(name)),
       onDir: (p, depth) => {
@@ -431,6 +421,7 @@ async function measureCache(def: Def, roots: Root[], onTick: (current: string) =
       },
       onTick: (_n, current) => onTick(current),
     });
+    if (incompleteWalk(stats)) throw new Error('Incomplete scan: unreadable, linked or limited cache entries');
     if (bytes > 0) {
       out.size += bytes;
       out.count += entries.size;
@@ -445,19 +436,21 @@ const touched = (f: { mtimeMs: number; birthtimeMs: number; atimeMs: number }) =
   Math.max(f.mtimeMs, f.birthtimeMs || 0, f.atimeMs || 0);
 
 /** Top-level entries of Downloads whose content was all last touched 90+ days ago. */
-async function findOldDownloads(): Promise<{ paths: string[]; size: number; folder: string }> {
+export async function findOldDownloads(): Promise<{ paths: string[]; size: number; folder: string; incomplete: boolean }> {
   const folder = knownFolder('downloads');
   const cutoff = Date.now() - OLD_DOWNLOAD_MS;
-  const result = { paths: [] as string[], size: 0, folder };
+  const result = { paths: [] as string[], size: 0, folder, incomplete: false };
   let list: Dirent[];
   try {
     list = await fsp.readdir(folder, { withFileTypes: true });
   } catch {
+    result.incomplete = true;
     return result;
   }
   const candidates = list.filter((d) => !DOWNLOAD_IGNORE.has(lower(d.name)) && (d.isFile() || d.isDirectory()));
   await mapLimit(candidates, 8, async (d) => {
     const p = path.join(folder, d.name);
+    if (!isSafeUserPath(p)) return;
     try {
       const st = await fsp.lstat(p);
       if (st.isSymbolicLink()) return;
@@ -472,7 +465,9 @@ async function findOldDownloads(): Promise<{ paths: string[]; size: number; fold
       let fresh = touched(st) >= cutoff;
       let size = 0;
       const ctrl = new AbortController();
+      const childDirs: string[] = [];
       const stats = await walk(p, {
+        onDir: dir => childDirs.push(dir),
         signal: ctrl.signal,
         maxEntries: 200_000,
         onFile: (f) => {
@@ -484,12 +479,15 @@ async function findOldDownloads(): Promise<{ paths: string[]; size: number; fold
         },
       });
       // A folder we could not fully check is treated as in use.
-      if (stats.truncated) fresh = true;
+      if (stats.truncated || stats.unreadable || stats.linked) { fresh = true; result.incomplete = true; }
+      if (stats.aborted) fresh = true;
+      for (const dir of childDirs) if (touched(await fsp.lstat(dir)) >= cutoff) fresh = true;
       if (!fresh) {
         result.paths.push(p);
         result.size += size;
       }
     } catch {
+      result.incomplete = true;
       // unreadable: leave it alone
     }
   });
@@ -538,6 +536,7 @@ async function measure(def: Def, onTick: (current: string) => void): Promise<Mea
   }
   if (def.kind === 'downloads') {
     const r = await findOldDownloads();
+    if (r.incomplete) throw new Error('Downloads could not be fully inspected');
     return { size: r.size, count: r.paths.length, locations: r.paths.length ? [displayPath(r.folder)] : [] };
   }
   const roots = (await def.roots?.()) ?? [];
@@ -547,6 +546,7 @@ async function measure(def: Def, onTick: (current: string) => void): Promise<Mea
 export async function scanJunk(progress: Progress): Promise<JunkCategory[]> {
   const defs = platformDefs();
   const found: JunkCategory[] = [];
+  const warnings: string[] = [];
   for (let i = 0; i < defs.length; i++) {
     const def = defs[i];
     progress({ task: 'junk', phase: def.name, done: i, total: defs.length });
@@ -571,117 +571,57 @@ export async function scanJunk(progress: Progress): Promise<JunkCategory[]> {
         safe: def.safe,
       });
     } catch {
-      // a category that cannot be measured is simply not offered
+      warnings.push(`${def.name} could not be fully inspected and was excluded`);
     }
   }
-  progress({ task: 'junk', phase: 'Done', done: defs.length, total: defs.length });
+  progress({ task: 'junk', phase: 'Done', done: defs.length, total: defs.length, warning: warnings.join('; ') });
   return found.sort((a, b) => b.size - a.size);
 }
 
-interface Tally {
-  freed: number;
-  removed: number;
-  locked: number;
-  denied: number;
-  refused: number;
-}
-
-async function cleanCache(def: Def, tally: Tally): Promise<void> {
-  const roots = (await def.roots?.()) ?? [];
-  const modifiedBefore = def.keepNewerThanMs ? Date.now() - def.keepNewerThanMs : undefined;
-  for (const root of roots) {
-    const excluded = new Set((root.exclude ?? []).map(lower));
-    let names: string[];
-    try {
-      names = (await fsp.readdir(root.path)).filter((n) => !excluded.has(lower(n)));
-    } catch (err) {
-      const code = (err as NodeJS.ErrnoException).code;
-      if (code === 'EPERM' || code === 'EACCES') tally.denied++;
+/** Preview exact leaf files; no directory-wide or Recycle Bin erasure. */
+export async function previewJunk(ids: unknown): Promise<RemovalPlan> {
+  if (!Array.isArray(ids) || ids.length > 40 || ids.some(id => typeof id !== 'string')) throw new Error('Invalid categories');
+  const defs = platformDefs();
+  if (ids.some(id => !defs.some(d => d.id === id))) throw new Error('Unsupported cleanup category');
+  const items: PlannedItem[] = [];
+  const seen = new Set<string>();
+  for (const def of defs.filter(d => ids.includes(d.id))) {
+    if (def.kind === 'downloads') {
+      const result = await findOldDownloads();
+      if (result.incomplete) throw new Error('Downloads preview is incomplete');
+      for (const p of result.paths) items.push(await plannedItem(p, 'trash'));
       continue;
     }
-    await mapLimit(names, 4, async (name) => {
-      const r = await deleteCacheEntry(path.join(root.path, name), root.path, { modifiedBefore });
-      tally.freed += r.freed;
-      tally.removed += r.removed;
-      tally.locked += r.locked;
-      tally.denied += r.denied;
-      if (r.refused) tally.refused++;
-    });
-  }
-}
-
-async function emptyRecycleBin(): Promise<{ freed: number; removed: number; ok: boolean }> {
-  const before = await measureRecycleBin();
-  try {
-    await powershell("Clear-RecycleBin -Force -ErrorAction SilentlyContinue", 180_000);
-  } catch {
-    return { freed: 0, removed: 0, ok: false };
-  }
-  const after = await measureRecycleBin();
-  return {
-    freed: Math.max(0, before.size - after.size),
-    removed: Math.max(0, before.count - after.count),
-    ok: after.count === 0,
-  };
-}
-
-const fmt = (n: number) => n.toLocaleString('en-US');
-
-/** Cleans the chosen categories. Locations are always re-derived here; the renderer only sends ids. */
-export async function cleanJunk(ids: unknown, progress: Progress): Promise<CleanResult> {
-  const wanted = new Set(Array.isArray(ids) ? ids.filter((x): x is string => typeof x === 'string') : []);
-  // Old downloads go to the bin, so they must run after the bin is emptied or they would be erased for good.
-  const binFirst = (d: Def) => (d.kind === 'downloads' ? 1 : 0);
-  const defs = platformDefs()
-    .filter((d) => wanted.has(d.id))
-    .sort((a, b) => binFirst(a) - binFirst(b));
-  const result: CleanResult = { freed: 0, removed: 0, failed: 0, skipped: [] };
-  let locked = 0;
-  let refused = 0;
-  let deniedOther = 0;
-
-  for (let i = 0; i < defs.length; i++) {
-    const def = defs[i];
-    progress({ task: 'clean', phase: def.name, done: i, total: defs.length });
-    try {
-      if (def.kind === 'recycle') {
-        const r = await emptyRecycleBin();
-        result.freed += r.freed;
-        result.removed += r.removed;
-        if (!r.ok) {
-          result.failed++;
-          result.skipped.push('Some Recycle Bin items could not be removed');
-        }
-        continue;
+    for (const root of await def.roots?.() ?? []) {
+      await assertNoLinks(root.path);
+      const files: string[] = [];
+      const cutoff = def.keepNewerThanMs ? Date.now() - def.keepNewerThanMs : undefined;
+      const excluded = new Set((root.exclude ?? []).map(lower));
+      const stats = await walk(root.path, {
+        maxEntries: 10_000,
+        skipDir: (_p, name, depth) => depth === 1 && excluded.has(lower(name)),
+        onFile: f => {
+          if (f.depth === 1 && excluded.has(lower(f.name))) return;
+          if (cutoff !== undefined && newest(f) >= cutoff) return;
+          files.push(f.path);
+        },
+      });
+      if (incompleteWalk(stats)) throw new Error('Cleanup preview is incomplete; nothing will be removed');
+      for (const p of files) {
+        if (seen.has(p)) continue;
+        seen.add(p);
+        const item = await plannedItem(p, 'delete');
+        if (cutoff !== undefined && newest(await fsp.lstat(p)) >= cutoff) throw new Error('A temporary file changed; preview again');
+        items.push(item);
+        if (items.length > 10_000) throw new Error('Preview limit reached; select fewer categories');
       }
-      if (def.kind === 'downloads') {
-        const { paths } = await findOldDownloads();
-        const r = await trashPaths(paths);
-        result.freed += r.freed;
-        result.removed += r.removed;
-        result.failed += r.failed;
-        result.skipped.push(...r.skipped.map((s) => `Old downloads: ${s}`));
-        if (r.removed > 0) result.skipped.push(`Old downloads went to the ${isWin ? 'Recycle Bin' : 'Trash'}, so you can restore them`);
-        continue;
-      }
-      const tally: Tally = { freed: 0, removed: 0, locked: 0, denied: 0, refused: 0 };
-      await cleanCache(def, tally);
-      result.freed += tally.freed;
-      result.removed += tally.removed;
-      result.failed += tally.locked + tally.denied;
-      locked += tally.locked;
-      refused += tally.refused;
-      if (tally.denied > 0 && def.adminNote) result.skipped.push(def.adminNote);
-      else deniedOther += tally.denied;
-    } catch {
-      result.failed++;
-      result.skipped.push(`${def.name} could not be cleaned`);
     }
   }
+  return removalPlans.create(items);
+}
 
-  if (locked) result.skipped.unshift(`${fmt(locked)} ${locked === 1 ? 'file' : 'files'} in use`);
-  if (deniedOther) result.skipped.push(`${fmt(deniedOther)} protected ${deniedOther === 1 ? 'file' : 'files'} left alone`);
-  if (refused) result.skipped.push(`${fmt(refused)} linked ${refused === 1 ? 'item' : 'items'} skipped for safety`);
-  progress({ task: 'clean', phase: 'Done', done: defs.length, total: defs.length });
-  return result;
+/** Raw category execution is retired; execution requires a preview token. */
+export async function cleanJunk(_ids: unknown, _progress: Progress): Promise<CleanResult> {
+  assertDestructiveFeaturesEnabled();
+  throw new Error('Preview cleanup and execute the resulting removal plan');
 }

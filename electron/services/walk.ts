@@ -2,6 +2,7 @@ import { promises as fsp, type Dirent, type Stats } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { app } from 'electron';
+import { assertNoLinks } from './pathSafety';
 
 export interface WalkFile {
   path: string;
@@ -36,6 +37,8 @@ export interface WalkStats {
   /** maxEntries was reached before the walk finished. */
   truncated: boolean;
   aborted: boolean;
+  unreadable: number;
+  linked: number;
 }
 
 interface Item {
@@ -48,13 +51,14 @@ interface Item {
 const TICK_EVERY = 2000;
 
 /**
- * Walks a folder tree without ever following symlinks, junctions or other reparse points.
- * Unreadable entries are skipped silently. The root itself is not reported to onDir.
+ * Rejects observable symlinks/junctions and reports incomplete traversal.
+ * These path-based checks are not an atomic defense against concurrent native renames.
+ * The root itself is not reported to onDir.
  */
 export function walk(root: string, opts: WalkOptions = {}): Promise<WalkStats> {
   const concurrency = Math.max(1, opts.concurrency ?? 16);
   const maxEntries = opts.maxEntries ?? Number.POSITIVE_INFINITY;
-  const stats: WalkStats = { bytes: 0, files: 0, dirs: 0, truncated: false, aborted: false };
+  const stats: WalkStats = { bytes: 0, files: 0, dirs: 0, truncated: false, aborted: false, unreadable: 0, linked: 0 };
   const stack: Item[] = [];
   let active = 0;
   let entries = 0;
@@ -100,8 +104,10 @@ export function walk(root: string, opts: WalkOptions = {}): Promise<WalkStats> {
   const readDir = async (item: Item) => {
     let list: Dirent[];
     try {
+      await assertNoLinks(item.path);
       list = await fsp.readdir(item.path, { withFileTypes: true });
     } catch {
+      stats.unreadable++;
       return;
     }
     const depth = item.depth + 1;
@@ -111,6 +117,7 @@ export function walk(root: string, opts: WalkOptions = {}): Promise<WalkStats> {
       // Dirent reports reparse points as links; those get an lstat to tell real links apart.
       if (d.isDirectory()) enterDir(p, d.name, depth);
       else if (d.isFile() || d.isSymbolicLink()) stack.push({ path: p, depth, op: 'stat' });
+      else stats.unreadable++; // Special filesystem objects cannot be fully reviewed as ordinary files.
     }
   };
 
@@ -119,12 +126,14 @@ export function walk(root: string, opts: WalkOptions = {}): Promise<WalkStats> {
     try {
       st = await fsp.lstat(item.path);
     } catch {
+      stats.unreadable++;
       return;
     }
-    if (st.isSymbolicLink()) return;
+    if (st.isSymbolicLink()) { stats.linked++; return; }
     const name = path.basename(item.path);
     if (st.isDirectory()) enterDir(item.path, name, item.depth);
     else if (st.isFile()) addFile(item.path, name, item.depth, st);
+    else stats.unreadable++;
   };
 
   return new Promise<WalkStats>((resolve) => {
@@ -142,7 +151,7 @@ export function walk(root: string, opts: WalkOptions = {}): Promise<WalkStats> {
         const item = stack.pop()!;
         active++;
         const job = item.op === 'dir' ? readDir(item) : statEntry(item);
-        void job.finally(() => {
+        void job.catch(() => { stats.unreadable++; }).finally(() => {
           active--;
           if (!finish()) pump();
         });
@@ -152,9 +161,11 @@ export function walk(root: string, opts: WalkOptions = {}): Promise<WalkStats> {
 
     void (async () => {
       try {
+        await assertNoLinks(root);
         const st = await fsp.lstat(root);
         if (st.isDirectory() && !st.isSymbolicLink()) stack.push({ path: root, depth: 0, op: 'dir' });
       } catch {
+        stats.unreadable++;
         // missing or unreadable root: empty result
       }
       pump();
@@ -209,7 +220,7 @@ export async function isRealDir(p: string): Promise<boolean> {
 
 export const homeDir = () => os.homedir();
 
-const caseInsensitive = process.platform === 'win32' || process.platform === 'darwin';
+const caseInsensitive = process.platform === 'win32';
 const norm = (p: string) => {
   const r = path.resolve(p);
   return caseInsensitive ? r.toLowerCase() : r;
@@ -220,7 +231,7 @@ export const samePath = (a: string, b: string) => norm(a) === norm(b);
 /** True when child is strictly below parent (lexical, after resolve). */
 export function isInside(parent: string, child: string): boolean {
   const rel = path.relative(norm(parent), norm(child));
-  return rel !== '' && !rel.startsWith('..') && !path.isAbsolute(rel);
+  return rel !== '' && rel !== '..' && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel);
 }
 
 /** Display form with ~ for the home folder. */
@@ -269,6 +280,8 @@ export const localAppData = () => process.env.LOCALAPPDATA || path.join(os.homed
 export const roamingAppData = () => process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming');
 
 export const DAY_MS = 24 * 60 * 60 * 1000;
+
+export const incompleteWalk = (s: WalkStats) => s.truncated || s.aborted || s.unreadable > 0 || s.linked > 0;
 
 /** Error codes that mean "in use or not allowed", which we skip and count rather than fail on. */
 export function isLockError(err: unknown): boolean {

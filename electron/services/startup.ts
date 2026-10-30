@@ -1,4 +1,5 @@
 import { shell } from 'electron';
+import { assertDestructiveFeaturesEnabled } from '../../shared/safety';
 import { execFile } from 'node:child_process';
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
@@ -446,6 +447,7 @@ export async function listStartup(): Promise<StartupItem[]> {
 }
 
 export async function setStartup(id: unknown, enabled: unknown): Promise<StartupItem[]> {
+  assertDestructiveFeaturesEnabled();
   if (typeof id !== 'string' || id.length > 600 || typeof enabled !== 'boolean') throw new Error('Invalid request');
   if (process.platform === 'win32') await setWindows(id, enabled);
   else if (process.platform === 'darwin') await setMac(id, enabled);

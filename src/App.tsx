@@ -1,4 +1,5 @@
 import type { ComponentType } from 'react';
+import { SAFETY_NOTICE } from '../shared/safety';
 import { Flow } from './components/Flow';
 import { Icon, IconSprite } from './components/Icon';
 import { Sidebar } from './components/Sidebar';
@@ -33,7 +34,7 @@ const SCREENS: Record<Screen, ComponentType> = {
 };
 
 function Shell() {
-  const { screen, settings, toasts } = useStore();
+  const { screen, settings, toasts, scanWarnings } = useStore();
   const bg = settings?.background ?? 'mist';
   const Current = SCREENS[screen];
 
@@ -53,6 +54,8 @@ function Shell() {
       )}
       {bg === 'grain' && <div className="bg-layer bg-grain" />}
       <Titlebar />
+      <div role="status" className="safety-notice">{SAFETY_NOTICE}</div>
+      {Object.entries(scanWarnings).filter(([,message]) => message).map(([task,message]) => <div className="safety-notice" role="status" key={task}>{message}</div>)}
       <div className="body">
         <Sidebar />
         <main className="main" key={screen}>

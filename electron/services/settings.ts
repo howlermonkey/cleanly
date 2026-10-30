@@ -2,6 +2,9 @@ import { app, safeStorage } from 'electron';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import type { AiProvider, Background, Settings } from '../../shared/types';
+import { transactionQueue } from './mutations';
+
+const transaction = transactionQueue();
 
 type StoredSettings = Omit<Settings, 'hasClaudeKey' | 'hasOpenAiKey'>;
 type StoredKeys = Partial<Record<AiProvider, string>>;
@@ -127,10 +130,10 @@ async function toPublic(): Promise<Settings> {
 }
 
 export async function getSettings(): Promise<Settings> {
-  return toPublic();
+  return transaction(toPublic);
 }
 
-export async function setSettings(patch: Partial<StoredSettings>): Promise<Settings> {
+async function saveSettings(patch: Partial<StoredSettings>): Promise<Settings> {
   const valid = validatePatch(patch);
   const next = { ...(await loadSettings()), ...valid };
   await writeJson(settingsFile(), next);
@@ -146,7 +149,7 @@ function checkKey(provider: AiProvider, key: string): string {
   return trimmed;
 }
 
-export async function setApiKey(provider: AiProvider, key: string | null): Promise<Settings> {
+async function saveApiKey(provider: AiProvider, key: string | null): Promise<Settings> {
   if (!PROVIDERS.includes(provider)) throw new Error('Unknown assistant provider.');
   if (key !== null && typeof key !== 'string') throw new Error('API key must be text.');
   const keys = { ...(await loadKeys()) };
@@ -167,7 +170,7 @@ export async function setApiKey(provider: AiProvider, key: string | null): Promi
 }
 
 /** Main-process only. Never send the result to the renderer or write it to a log. */
-export async function getApiKey(provider: AiProvider): Promise<string | null> {
+async function readApiKey(provider: AiProvider): Promise<string | null> {
   const stored = (await loadKeys())[provider];
   if (!stored) return null;
   if (!safeStorage.isEncryptionAvailable()) {
@@ -179,3 +182,7 @@ export async function getApiKey(provider: AiProvider): Promise<string | null> {
     throw new Error('The saved API key could not be unlocked. Please add it again in Settings.');
   }
 }
+
+export const setSettings = (patch: Partial<StoredSettings>): Promise<Settings> => transaction(() => saveSettings(patch));
+export const setApiKey = (provider: AiProvider, key: string | null): Promise<Settings> => transaction(() => saveApiKey(provider, key));
+export const getApiKey = (provider: AiProvider): Promise<string | null> => transaction(() => readApiKey(provider));

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import type { InstalledApp } from '../../shared/types';
 import { api } from '../api';
+import { DESTRUCTIVE_FEATURES_ENABLED } from '../../shared/safety';
 import { Icon } from '../components/Icon';
 import { Empty, ScreenHead, Segmented } from '../components/ui';
 import { formatBytes, sum, timeAgo } from '../lib/format';
@@ -218,7 +219,7 @@ export default function Apps() {
                       <button
                         type="button"
                         className="btn small"
-                        disabled={busy !== null}
+                        disabled={busy !== null || !DESTRUCTIVE_FEATURES_ENABLED}
                         onClick={() => setConfirming(app.id)}
                       >
                         <Icon name="trash" />

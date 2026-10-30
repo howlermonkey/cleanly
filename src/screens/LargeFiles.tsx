@@ -1,3 +1,4 @@
+import { useRemovalPreview } from '../components/RemovalPreview';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import type { IconName, LargeFile } from '../../shared/types';
 import { api } from '../api';
@@ -60,7 +61,8 @@ function scan(min: number): Promise<LargeFile[]> {
 }
 
 export default function LargeFiles() {
-  const { settings, progress, system, disks, toast, refreshDisk } = useStore();
+  const { request: previewRemoval, dialog: removalDialog } = useRemovalPreview();
+  const { settings, progress, system, disks, toast } = useStore();
   const min = settings ? settings.largeFileMinMb * MB : null;
   const [files, setFiles] = useState<LargeFile[] | null>(cache && cache.min === min ? cache.files : null);
   const [loading, setLoading] = useState(false);
@@ -68,7 +70,6 @@ export default function LargeFiles() {
   const [filter, setFilter] = useState<Filter>('all');
   const [sort, setSort] = useState<Sort>('size');
   const [selected, setSelected] = useState<Set<string>>(new Set());
-  const [confirming, setConfirming] = useState(false);
   const [trashing, setTrashing] = useState(false);
 
   const home = system?.homeDir;
@@ -146,39 +147,19 @@ export default function LargeFiles() {
     api.revealPath(path).catch((e: unknown) => toast(e instanceof Error ? e.message : 'Could not show that file', 'err'));
   };
 
-  const trash = async () => {
-    setConfirming(false);
-    setTrashing(true);
-    const paths = chosen.map((f) => f.path);
-    try {
-      const result = await api.trashPaths(paths);
-      const moved = result.removed;
-      const note = result.failed > 0 ? ` · ${result.failed} could not be moved` : '';
-      toast(`Moved ${moved} ${moved === 1 ? 'file' : 'files'} (${formatBytes(result.freed)}) to Trash${note}`, result.failed && !moved ? 'err' : 'ok');
-      if (result.failed > 0) {
-        await load(true);
-      } else {
-        const gone = new Set(paths);
-        const next = (files ?? []).filter((f) => !gone.has(f.path));
-        setFiles(next);
-        if (min !== null) cache = { min, files: next };
-        setSelected(new Set());
-      }
-      void refreshDisk();
-    } catch (e) {
-      toast(e instanceof Error ? e.message : 'Could not move files to Trash', 'err');
-    } finally {
-      setTrashing(false);
-    }
+  const trash = async () => { setTrashing(true);
+    try { await previewRemoval(() => api.previewTrash(chosen.map(f => f.path)), () => load(true)); }
+    finally { setTrashing(false); }
   };
 
   const total = splitBytes(totalSize);
 
   return (
     <div className="screen">
+      {removalDialog}
       <ScreenHead
         title="Large Files"
-        sub={`Files over ${settings ? formatBytes(settings.largeFileMinMb * MB) : '…'} that you may have forgotten${otherDrives ? ', on every drive' : ''}. Anything you remove goes to the Trash.`}
+        sub={`Files over ${settings ? formatBytes(settings.largeFileMinMb * MB) : '…'} in ordinary personal folders. Application data and credential stores are excluded.`}
       >
         {files && files.length > 0 && (
           <div className="fx-stat">
@@ -328,25 +309,7 @@ export default function LargeFiles() {
           </section>
 
           {chosen.length > 0 &&
-            (confirming ? (
-              <div className="fx-dock" role="alertdialog" aria-label="Confirm move to Trash">
-                <span className="chip-ico">
-                  <Icon name="trash" />
-                </span>
-                <div className="grow">
-                  <div className="fx-dock-q">
-                    Move {chosen.length} {chosen.length === 1 ? 'file' : 'files'} ({formatBytes(chosenSize)}) to Trash?
-                  </div>
-                  <div className="fx-dock-note">You can restore them from the Trash until you empty it.</div>
-                </div>
-                <button type="button" className="btn ghost" onClick={() => setConfirming(false)}>
-                  Cancel
-                </button>
-                <button type="button" className="btn primary" onClick={() => void trash()} autoFocus>
-                  Move to Trash
-                </button>
-              </div>
-            ) : (
+            (
               <div className="fx-dock">
                 <div className="grow">
                   <div className="fx-dock-num">
@@ -354,7 +317,7 @@ export default function LargeFiles() {
                     <small>{splitBytes(chosenSize).unit} selected</small>
                   </div>
                   <div className="fx-dock-sub">
-                    {chosen.length} {chosen.length === 1 ? 'file' : 'files'} · goes to Trash, restorable
+                    {chosen.length} {chosen.length === 1 ? 'file' : 'files'} · preview only
                   </div>
                 </div>
                 <button type="button" className="btn ghost" onClick={() => setSelected(new Set())} disabled={trashing}>
@@ -364,13 +327,13 @@ export default function LargeFiles() {
                   type="button"
                   className="btn primary"
                   disabled={trashing || loading}
-                  onClick={() => (settings?.confirmBeforeClean === false ? void trash() : setConfirming(true))}
+                  onClick={() => void trash()}
                 >
                   {trashing ? <span className="spinner" style={{ borderColor: 'rgba(255,255,255,0.35)', borderTopColor: '#fff' }} /> : <Icon name="trash" />}
-                  {trashing ? 'Moving' : 'Move to Trash'}
+                  {trashing ? 'Preparing' : 'Preview removal'}
                 </button>
               </div>
-            ))}
+            )}
         </>
       )}
     </div>

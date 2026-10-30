@@ -1,5 +1,5 @@
-appId: app.cleanly.desktop
-productName: Cleanly
+appId: app.evencleaner.development
+productName: EvenCleaner Development
 copyright: Copyright © 2026 Cleanly
 directories:
   output: release
@@ -13,6 +13,7 @@ asar: true
 # no version in file names, so releases/latest/download/<name> links never go stale
 artifactName: ${productName}-${os}-${arch}.${ext}
 publish: null
+beforePack: ./scripts/check-release.cjs
 
 win:
   icon: build/icon.png
@@ -26,7 +27,7 @@ nsis:
   perMachine: false
   allowToChangeInstallationDirectory: true
   createDesktopShortcut: true
-  shortcutName: Cleanly
+  shortcutName: EvenCleaner Development
   artifactName: ${productName}-setup.${ext}
 portable:
   artifactName: ${productName}-portable.${ext}
@@ -39,12 +40,10 @@ mac:
       arch: [arm64, x64]
     - target: zip
       arch: [arm64, x64]
-  # No Developer ID yet: ad-hoc sign so Apple Silicon builds launch once quarantine is cleared.
-  # Hardened runtime must stay off with ad-hoc signing, otherwise library validation rejects Electron's frameworks.
-  identity: '-'
-  hardenedRuntime: false
-  gatekeeperAssess: false
-  notarize: false
+  # Packaging is blocked. Real Developer ID credentials and notarization are prerequisites.
+  hardenedRuntime: true
+  gatekeeperAssess: true
+  notarize: true
   entitlements: build/entitlements.mac.plist
   entitlementsInherit: build/entitlements.mac.plist
   extendInfo:
@@ -52,8 +51,8 @@ mac:
     NSDocumentsFolderUsageDescription: Cleanly measures your Documents to show what takes up space.
     NSDownloadsFolderUsageDescription: Cleanly looks for old downloads you may want to remove.
 dmg:
-  title: Cleanly
-  sign: false
+  title: EvenCleaner Development
+  sign: true
   contents:
     - { x: 150, y: 190 }
     - { x: 390, y: 190, type: link, path: /Applications }

@@ -1,3 +1,4 @@
+import { assertDestructiveFeaturesEnabled } from '../shared/safety';
 import type {
   AiAdvice,
   CleanResult,
@@ -493,6 +494,16 @@ export function createMockApi(): CleanlyApi {
   }
 
   return {
+    async previewJunk(ids) {
+      return { id: 'demo', expiresAt: Date.now() + 300_000, items: junk.filter(c => ids.includes(c.id)).map(c => ({ path: `Demo: ${c.name}`, size: c.size, action: 'delete' as const })) };
+    },
+    async previewTrash(paths) {
+      return { id: 'demo', expiresAt: Date.now() + 300_000, items: paths.map(path => ({ path, size: 0, action: 'trash' as const })) };
+    },
+    async previewDuplicates(groups) {
+      return { id: 'demo', expiresAt: Date.now() + 300_000, items: groups.flatMap(g => g.remove.map(path => ({ path, size: 0, action: 'trash' as const }))) };
+    },
+    async executePlan() { throw new Error('Removal is disabled in the development preview'); },
     async system() {
       await wait(100, 300);
       return { ...system };
@@ -525,6 +536,7 @@ export function createMockApi(): CleanlyApi {
     },
 
     async cleanJunk(ids) {
+      assertDestructiveFeaturesEnabled();
       const picked = junk.filter((c) => ids.includes(c.id) && c.size > 0);
       let freed = 0;
       let removed = 0;
@@ -591,6 +603,7 @@ export function createMockApi(): CleanlyApi {
     },
 
     async trashPaths(paths) {
+      assertDestructiveFeaturesEnabled();
       await wait(400, 1000);
       let freed = 0;
       let removed = 0;
@@ -625,6 +638,7 @@ export function createMockApi(): CleanlyApi {
     },
 
     async setStartupItem(id, enabled) {
+      assertDestructiveFeaturesEnabled();
       const item = startup.find((s) => s.id === id);
       if (!item) throw new Error('That startup item no longer exists');
       if (!item.canToggle) throw new Error(`${item.name} is managed by Windows and cannot be changed here`);
@@ -640,6 +654,7 @@ export function createMockApi(): CleanlyApi {
     },
 
     async uninstallApp(id) {
+      assertDestructiveFeaturesEnabled();
       await wait(800, 1200);
       const app = apps.find((a) => a.id === id);
       if (!app) return { ok: false, message: 'That app is no longer installed' };

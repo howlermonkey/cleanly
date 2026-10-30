@@ -57,6 +57,7 @@ function toProfile(body: unknown): TipsProfile {
 }
 
 export async function getTipsProfile(): Promise<TipsProfile> {
+  if (!TIPS_API || !TIPS_CREATOR) throw new Error('Donations are disabled in this development fork');
   if (cached && Date.now() - cached.at < PROFILE_TTL_MS) return cached.profile;
   inflight ??= request(`${TIPS_API}?creator=${encodeURIComponent(TIPS_CREATOR)}`, { headers: { accept: 'application/json' } })
     .then(toProfile)
@@ -77,6 +78,7 @@ function cleanText(v: unknown, max: number): string {
 }
 
 export async function createTipCheckout(req: TipRequest): Promise<{ url: string }> {
+  if (!TIPS_API || !TIPS_CREATOR) throw new Error('Donations are disabled in this development fork');
   if (!isRecord(req)) throw new Error('Invalid tip.');
   const amount = req.amount;
   if (typeof amount !== 'number' || !Number.isFinite(amount)) throw new Error('Please choose an amount.');
@@ -103,7 +105,8 @@ export async function createTipCheckout(req: TipRequest): Promise<{ url: string 
   const url = isRecord(body) ? body.url : null;
   if (typeof url !== 'string') throw new Error('The tips service did not return a checkout link.');
   try {
-    if (new URL(url).protocol !== 'https:') throw new Error();
+    const checkout = new URL(url);
+    if (checkout.protocol !== 'https:' || checkout.hostname !== 'checkout.stripe.com' || checkout.username || checkout.password || checkout.port) throw new Error();
   } catch {
     throw new Error('The tips service returned an invalid checkout link.');
   }

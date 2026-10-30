@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import type { DiskInfo, IconName, ScanProgress, SpaceNode } from '../../shared/types';
 import { getDisk, listDisks, sameMount } from './disk';
-import { DAY_MS, displayPath, isInside, knownFolders, samePath, walk } from './walk';
+import { DAY_MS, displayPath, isInside, knownFolders, samePath, walk, incompleteWalk } from './walk';
 
 type Progress = (p: ScanProgress) => void;
 
@@ -98,6 +98,7 @@ const sum = (nodes: SpaceNode[], key: 'size' | 'reclaimable') => nodes.reduce((s
 
 /** Shared state of one scan: entry budget, throttled progress and step counter. */
 class Scan {
+  partial = false;
   budget = MAX_ENTRIES;
   done = 0;
   total = 0;
@@ -108,7 +109,8 @@ class Scan {
   constructor(private readonly progress: Progress) {}
 
   step(phase: string, current?: string) {
-    this.progress({ task: 'spaces', phase, done: this.done, total: this.total, current });
+    this.progress({ task: 'spaces', phase, done: this.done, total: this.total, current,
+      ...(phase === 'Done' ? { warning: this.partial ? 'Space Map is partial: unreadable paths or the scan limit prevented a complete measurement.' : '' } : {}) });
   }
 
   tick(phase: string, current: string) {
@@ -131,7 +133,7 @@ interface MeasureOpts {
 
 /** Walks one folder; its direct children become the drill-down level. Null when empty or out of budget. */
 async function measure(scan: Scan, dir: string, opts: MeasureOpts): Promise<SpaceNode | null> {
-  if (scan.budget <= 0) return null;
+  if (scan.budget <= 0) { scan.partial = true; return null; }
   const phase = `Measuring ${opts.label}`;
   scan.step(phase);
   const isDownloads = samePath(dir, scan.known.downloads);
@@ -161,6 +163,7 @@ async function measure(scan: Scan, dir: string, opts: MeasureOpts): Promise<Spac
     onTick: (_n, current) => scan.tick(phase, current),
   });
   scan.budget -= stats.files + stats.dirs;
+  if (incompleteWalk(stats)) scan.partial = true;
   scan.done++;
   if (stats.bytes <= 0) return null;
 
@@ -178,16 +181,18 @@ async function measure(scan: Scan, dir: string, opts: MeasureOpts): Promise<Spac
 }
 
 interface TopLevel {
+  incomplete: boolean;
   folders: string[];
   files: { name: string; size: number | null }[];
 }
 
 async function readTop(dir: string, isDriveRoot: boolean): Promise<TopLevel> {
-  const out: TopLevel = { folders: [], files: [] };
+  const out: TopLevel = { folders: [], files: [], incomplete: false };
   let list;
   try {
     list = await fsp.readdir(dir, { withFileTypes: true });
   } catch {
+    out.incomplete = true;
     return out;
   }
   for (const d of list) {
@@ -203,6 +208,7 @@ async function readTop(dir: string, isDriveRoot: boolean): Promise<TopLevel> {
       if (st.isDirectory()) out.folders.push(d.name);
       else if (st.isFile()) out.files.push({ name: d.name, size: st.size });
     } catch {
+      out.incomplete = true;
       // hiberfil.sys and friends refuse to be opened; their size may still be listed by the OS
       if (d.isFile()) out.files.push({ name: d.name, size: null });
     }
@@ -278,12 +284,13 @@ function remainderNode(disk: DiskInfo | null, measured: number, name: string): S
 async function scanHome(scan: Scan): Promise<SpaceNode> {
   const home = os.homedir();
   const top = await readTop(home, false);
+  scan.partial ||= top.incomplete;
   scan.total = top.folders.length;
   const children = await homeChildren(scan, home, top);
 
   const homeSize = sum(children, 'size');
   const disk = await getDisk().catch(() => null);
-  const rest = remainderNode(disk, homeSize, 'System & apps');
+  const rest = remainderNode(disk, homeSize, 'Unmeasured & system storage');
   if (rest) children.push(rest);
 
   children.sort((a, b) => b.size - a.size);
@@ -298,6 +305,7 @@ async function scanDrive(scan: Scan, disk: DiskInfo): Promise<SpaceNode> {
   const hasHome = isInside(mount, home);
   const top = await readTop(mount, true);
   const homeTop = hasHome ? await readTop(home, false) : null;
+  scan.partial ||= top.incomplete || Boolean(homeTop?.incomplete);
   scan.total = top.folders.length + (homeTop?.folders.length ?? 0);
 
   const children: SpaceNode[] = [];
@@ -346,7 +354,7 @@ async function scanDrive(scan: Scan, disk: DiskInfo): Promise<SpaceNode> {
   }
   children.push(...looseNodes(mount, known.filter((f) => !SYSTEM_FILES.test(f.name))));
 
-  const rest = remainderNode(disk, sum(children, 'size'), disk.system ? 'System & hidden' : 'Hidden & reserved');
+  const rest = remainderNode(disk, sum(children, 'size'), 'Unmeasured & reserved');
   if (rest) children.push(rest);
 
   children.sort((a, b) => b.size - a.size);

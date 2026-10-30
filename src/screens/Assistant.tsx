@@ -18,7 +18,7 @@ const PROVIDERS: Record<AiProvider, { name: string; keyUrl: string; placeholder:
 };
 
 const SUGGESTIONS = ['What can I safely delete?', 'Why is my disk so full?', "Which large files haven't I used in a year?"];
-const PRIVACY = 'Only file names, paths and sizes are shared — never file contents.';
+const PRIVACY = 'Your question, file names, paths, sizes, modification dates and disk summary are shared — never file contents.';
 const LARGE_MIN = 500 * 1024 * 1024;
 
 const norm = (p: string) => p.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();

@@ -1,4 +1,5 @@
 import './boot';
+import { assertDestructiveFeaturesEnabled } from '../shared/safety';
 import { app, BrowserWindow, ipcMain, nativeTheme, shell } from 'electron';
 import os from 'node:os';
 import path from 'node:path';
@@ -17,7 +18,9 @@ import { getDisk, listDisks } from './services/disk';
 import { getFileIcons } from './services/icons';
 import { scanDuplicates } from './services/duplicates';
 import { sendFeedback } from './services/feedback';
-import { cleanJunk, scanJunk } from './services/junk';
+import { cleanJunk, scanJunk, previewJunk } from './services/junk';
+import { previewTrash, previewDuplicates, executePlan } from './services/plans';
+import { mutations } from './services/mutations';
 import { scanLargeFiles } from './services/largeFiles';
 import { getProtection } from './services/protection';
 import { getSettings, setApiKey, setSettings } from './services/settings';
@@ -27,6 +30,7 @@ import { createTipCheckout, getTipsProfile } from './services/tips';
 import { trashPaths } from './services/trash';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
+app.setName('EvenCleaner Development');
 const devServer = process.env.VITE_DEV_SERVER_URL;
 let win: BrowserWindow | null = null;
 
@@ -86,6 +90,10 @@ const handlers: Handlers = {
   disks: () => listDisks(),
   fileIcons: (paths) => getFileIcons(paths),
   scanJunk: () => scanJunk(progress),
+  previewJunk,
+  previewTrash,
+  previewDuplicates,
+  executePlan,
   cleanJunk: (ids) => cleanJunk(ids, progress),
   scanSpaces: (root) => scanSpaces(progress, root),
   scanLargeFiles: (minBytes) => scanLargeFiles(minBytes, progress),
@@ -121,7 +129,9 @@ function registerIpc() {
       // Only our own renderer may call into the main process.
       const from = event.senderFrame?.url ?? '';
       if (!isAppUrl(from)) throw new Error('Blocked IPC from an untrusted frame');
+      if (['cleanJunk', 'trashPaths', 'uninstallApp', 'setStartupItem', 'executePlan'].includes(method)) assertDestructiveFeaturesEnabled();
       const fn = handlers[method] as (...a: unknown[]) => unknown;
+      if (['uninstallApp', 'setStartupItem'].includes(method)) return mutations.run(method, async () => fn(...args));
       return fn(...args);
     });
   }
@@ -136,7 +146,7 @@ function createWindow() {
     minHeight: 740,
     show: false,
     backgroundColor: '#f2f3f6',
-    title: 'Cleanly',
+    title: 'EvenCleaner Development',
     titleBarStyle: 'hidden',
     ...(isMac
       ? { trafficLightPosition: { x: 20, y: 16 } }
@@ -151,6 +161,8 @@ function createWindow() {
   });
 
   win.once('ready-to-show', () => win?.show());
+  win.webContents.session.setPermissionRequestHandler((_webContents, _permission, callback) => callback(false));
+  win.webContents.session.setPermissionCheckHandler(() => false);
   win.on('closed', () => {
     win = null;
   });

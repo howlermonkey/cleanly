@@ -1,3 +1,4 @@
+import { useRemovalPreview } from '../components/RemovalPreview';
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent } from 'react';
 import type { InstalledApp, ProtectionStatus, StartupItem } from '../../shared/types';
 import { api } from '../api';
@@ -125,6 +126,7 @@ function shortBadge(bytes: number): string {
 const delay = (s: number): CSSProperties => ({ animationDelay: `${s}s` });
 
 export default function SmartScan() {
+  const { request: previewRemoval, dialog: removalDialog } = useRemovalPreview();
   const {
     go,
     junk,
@@ -139,10 +141,8 @@ export default function SmartScan() {
     cleaning,
     cleanPulse,
     lastCleanAt: cleanedAt,
-    settings,
     smartScan,
-    cleanJunk,
-    toast,
+    scanWarnings,
   } = useStore();
   const now = useNow(30_000);
 
@@ -156,31 +156,15 @@ export default function SmartScan() {
   const itemCount = sum(safe.map((c) => c.count));
   const canClean = !scanning && !cleaning && safeIds.length > 0;
 
-  const [armed, setArmed] = useState(false);
-  useEffect(() => {
-    if (!armed) return;
-    const t = setTimeout(() => setArmed(false), 5000);
-    return () => clearTimeout(t);
-  }, [armed]);
-
-  const clean = useCallback(async () => {
-    if (!canClean) return;
-    if ((settings?.confirmBeforeClean ?? true) && !armed) {
-      setArmed(true);
-      return;
-    }
-    setArmed(false);
-    const res = await cleanJunk(safeIds);
-    if (!res) return;
-    const note = res.skipped.length ? ` · ${res.skipped.slice(0, 2).join(', ')}` : res.failed ? ` · ${res.failed} in use, skipped` : '';
-    toast(`Freed ${formatBytes(res.freed)}${note}`);
-  }, [canClean, settings, armed, cleanJunk, safeIds, toast]);
+  const clean = async () => {
+    if (canClean) await previewRemoval(() => api.previewJunk(safeIds));
+  };
 
   const rescan = useCallback(() => {
     void smartScan();
   }, [smartScan]);
 
-  // Enter cleans, like the concept's hint says, unless focus is on something that handles Enter itself
+  // Enter opens the preview unless focus is on a control that handles Enter itself.
   const cleanRef = useRef(clean);
   useEffect(() => {
     cleanRef.current = clean;
@@ -212,7 +196,7 @@ export default function SmartScan() {
   } else if (afterClean && cleanedAt !== null) {
     eyebrow = `${allClear ? 'All clear' : 'Cleaned'} · ${timeAgo(cleanedAt, now)}`;
   } else if (lastScanAt) {
-    eyebrow = `Scan complete · ${new Date(lastScanAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`;
+    eyebrow = `${scanWarnings.junk ? 'Partial scan' : 'Scan complete'} · ${new Date(lastScanAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`;
   } else {
     eyebrow = 'Not scanned yet';
     dot = 'idle';
@@ -223,16 +207,14 @@ export default function SmartScan() {
   let hint: string;
   if (cleaning) hint = 'Deleting caches and temp files…';
   else if (scanning) hint = 'Looking for caches and temp files…';
-  else if (armed) hint = 'Caches are deleted for good · press again';
-  else if (itemCount) hint = `${itemCount.toLocaleString('en-US')} items · ${safeIds.length} ${safeIds.length === 1 ? 'group' : 'groups'} · ↵ to clean`;
+  else if (itemCount) hint = `${itemCount.toLocaleString('en-US')} items · ${safeIds.length} ${safeIds.length === 1 ? 'group' : 'groups'} · ↵ to preview`;
   else if (lastScanAt) hint = 'Nothing safe to remove right now';
   else hint = 'Run a scan to see what can go';
 
-  let ctaLabel = 'Clean';
+  let ctaLabel = 'Preview cleanup';
   let ctaSub = reclaimable > 0 ? formatBytes(reclaimable) : 'Nothing to clean';
   if (cleaning) [ctaLabel, ctaSub] = ['Cleaning', formatBytes(reclaimable)];
   else if (scanning) [ctaLabel, ctaSub] = ['Scanning', phase ?? 'one moment'];
-  else if (armed) [ctaLabel, ctaSub] = ['Clean now?', `${formatBytes(reclaimable)} for good`];
   else if (nothingLeft) [ctaLabel, ctaSub] = ['Rescan', allClear ? 'all clear' : 'nothing to clean'];
   else if (!lastScanAt) [ctaLabel, ctaSub] = ['Scan', 'find junk'];
 
@@ -293,6 +275,7 @@ export default function SmartScan() {
 
   return (
     <div className="screen home">
+      {removalDialog}
       <div className="home-top">
         <section className="hero card-w rise" style={delay(0.08)} aria-label="Scan result">
           <div className="hero-plume">
@@ -327,11 +310,6 @@ export default function SmartScan() {
                   <div className="hero-progress">
                     <Progress value={busyProgress} />
                   </div>
-                )}
-                {armed && (
-                  <button type="button" className="cancel" onClick={() => setArmed(false)}>
-                    Cancel
-                  </button>
                 )}
               </div>
             </div>
@@ -426,13 +404,9 @@ export default function SmartScan() {
                     <span className="spinner pill-spin" />
                     Removing
                   </>
-                ) : armed ? (
-                  <>
-                    Confirm <Icon name="check" />
-                  </>
                 ) : (
                   <>
-                    Remove <Icon name="arrow" />
+                    Preview <Icon name="arrow" />
                   </>
                 )}
               </button>
