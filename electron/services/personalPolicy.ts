@@ -5,7 +5,7 @@ import { isInside, samePath } from './pathSafety';
 
 const PROTECTED = /^(appdata|library|applications|program files( \(x86\))?|programdata|windows(\.old)?|node_modules|vendor|\.git|\.ssh|\.gnupg|\.aws|\.azure|\.kube|\.config|\.local|\.codex|\.agents|\.docker|\.npm|\.cache|\.trash|\$recycle\.bin|system volume information|recovery|boot|efi)$/i;
 const PACKAGE = /\.(app|photoslibrary|photolibrary|musiclibrary|tvlibrary|imovielibrary|fcpbundle|logicx|band|aplibrary|lrdata|lrlibrary|bundle|framework|plugin|kext|xcodeproj|xcworkspace|pkg|mpkg|sparsebundle|rtfd|pages|numbers|key|vmwarevm|pvm|utm)$/i;
-const SENSITIVE_FILE = /(?:^ntuser\.|^credentials$|^id_(?:rsa|ed25519|ecdsa)|\.(?:db|sqlite[0-9]?|pst|ost|keychain(?:-db)?|pem|p12|pfx|wallet)$)/i;
+const SENSITIVE_FILE = /(?:^ntuser\.|^credentials$|^\.env(?:\.|$)|^\.(?:npmrc|pypirc|netrc|git-credentials)$|^id_(?:rsa|ed25519|ecdsa)|\.(?:db|sqlite[0-9]?|pst|ost|keychain(?:-db)?|pem|p12|pfx|wallet)$)/i;
 
 export function personalRoots(): string[] {
   return [...new Set(Object.values(knownFolders()).map(p => path.resolve(p)))];

@@ -333,6 +333,7 @@ test('custom discovery scope finds small duplicates without widening removal per
   const a = await f.write('Collection/a.txt', 'identical small content');
   const b = await f.write('Collection/b.txt', 'identical small content');
   await f.write('Collection/.hidden.txt', 'identical small content');
+  for (const name of ['.env', '.env.production', '.npmrc', '.pypirc', '.netrc', '.git-credentials']) await f.write('Collection/' + name, 'identical small content');
   await f.write('Collection/mail.pst', 'identical small content');
   await f.write('Documents/outside.txt', 'identical small content');
   const options = { roots: [path.dirname(a)], exclusions: [], minBytes: 1, includeHidden: false };
