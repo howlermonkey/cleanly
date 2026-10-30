@@ -1,3 +1,4 @@
+import { ScanDetails } from '../components/ScanDetails';
 import { useRemovalPreview } from '../components/RemovalPreview';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import type { DuplicateGroup, IconName } from '../../shared/types';
@@ -29,31 +30,33 @@ const wasted = (g: DuplicateGroup) => g.size * Math.max(0, g.files.length - 1);
 
 // hashing is slow; keep the result while the app is open
 let cache: DuplicateGroup[] | null = null;
+let cacheKey = '';
 let pending: Promise<DuplicateGroup[]> | null = null;
-
-function scan(): Promise<DuplicateGroup[]> {
-  pending ??= api.scanDuplicates().then(
-    (groups) => {
-      cache = groups.filter((g) => g.files.length > 1).sort((a, b) => wasted(b) - wasted(a));
-      pending = null;
-      return cache;
-    },
-    (e: unknown) => {
-      pending = null;
-      throw e;
-    },
-  );
-  return pending;
+let pendingKey = '';
+function scan(key: string): Promise<DuplicateGroup[]> {
+  if (pending && pendingKey === key) return pending;
+  const previous = pending;
+  const promise = (async () => {
+    if (previous) { await api.cancelScan('dupes'); await previous.catch(() => undefined); }
+    const groups = await api.scanDuplicates();
+    cache = groups.filter(g => g.files.length > 1).sort((a,b) => wasted(b) - wasted(a));
+    cacheKey = key; return cache;
+  })();
+  pending = promise; pendingKey = key;
+  void promise.finally(() => { if (pending === promise) pending = null; }).catch(() => undefined);
+  return promise;
 }
 
 export default function Duplicates() {
   const { request: previewRemoval, dialog: removalDialog } = useRemovalPreview();
-  const { progress, system, disks, toast } = useStore();
-  const [groups, setGroups] = useState<DuplicateGroup[] | null>(cache);
+  const { progress, system, disks, toast, settings } = useStore();
+  const scanKey = settings ? JSON.stringify([settings.scanRoots, settings.excludedPaths, settings.duplicateMinBytes, settings.includeHidden]) : '';
+  const [retained, setRetained] = useState<Set<string>>(new Set());
+  const [groups, setGroups] = useState<DuplicateGroup[] | null>(cacheKey === scanKey ? cache : null);
   const [loading, setLoading] = useState(false);
   const [failed, setFailed] = useState(false);
   const [keep, setKeep] = useState<Record<string, string>>({});
-  const [skip, setSkip] = useState<Set<string>>(new Set());
+  const [skip, setSkip] = useState<Set<string>>(new Set((cacheKey === scanKey ? cache ?? [] : []).map(g => g.hash)));
   const [limit, setLimit] = useState(PAGE);
   const [trashing, setTrashing] = useState(false);
 
@@ -62,18 +65,21 @@ export default function Duplicates() {
 
   const load = useCallback(
     async (force = false) => {
-      if (!force && cache) {
+      if (!scanKey) return;
+      if (!force && cache && cacheKey === scanKey) {
         setGroups(cache);
         return;
       }
       if (force) cache = null;
+      setGroups(null);
       setLoading(true);
       setFailed(false);
       try {
-        const next = await scan();
+        const next = await scan(scanKey);
         setGroups(next);
         setKeep({});
-        setSkip(new Set());
+        setSkip(new Set(next.map(g => g.hash)));
+        setRetained(new Set());
         setLimit(PAGE);
       } catch (e) {
         setFailed(true);
@@ -82,7 +88,7 @@ export default function Duplicates() {
         setLoading(false);
       }
     },
-    [toast],
+    [toast, scanKey],
   );
 
   useEffect(() => {
@@ -92,8 +98,8 @@ export default function Duplicates() {
   const keeperOf = useCallback((g: DuplicateGroup) => keep[g.hash] ?? newestPath(g), [keep]);
 
   const toTrash = useMemo(
-    () => (groups ?? []).filter((g) => !skip.has(g.hash)).flatMap((g) => g.files.filter((f) => f.path !== keeperOf(g)).map((f) => ({ path: f.path, size: g.size }))),
-    [groups, skip, keeperOf],
+    () => (groups ?? []).filter((g) => !skip.has(g.hash) && g.files.every(f => f.removalEligible !== false)).flatMap((g) => g.files.filter((f) => f.path !== keeperOf(g) && !retained.has(f.path)).map((f) => ({ path: f.path, size: g.size }))),
+    [groups, skip, keeperOf, retained],
   );
   const trashSize = sum(toTrash.map((f) => f.size));
   const totalWasted = sum((groups ?? []).map(wasted));
@@ -111,7 +117,7 @@ export default function Duplicates() {
   };
 
   const trash = async () => { setTrashing(true);
-    try { await previewRemoval(() => api.previewDuplicates((groups ?? []).filter(g => !skip.has(g.hash)).map(g => ({ hash: g.hash, keeper: keeperOf(g), remove: g.files.filter(f => f.path !== keeperOf(g)).map(f => f.path) }))), () => load(true)); }
+    try { await previewRemoval(() => api.previewDuplicates((groups ?? []).filter(g => !skip.has(g.hash) && g.files.every(f => f.removalEligible !== false)).map(g => ({ hash: g.hash, keeper: keeperOf(g), remove: g.files.filter(f => f.path !== keeperOf(g) && !retained.has(f.path)).map(f => f.path) })).filter(g => g.remove.length)), () => load(true)); }
     finally { setTrashing(false); }
   };
 
@@ -124,7 +130,8 @@ export default function Duplicates() {
   return (
     <div className="screen">
       {removalDialog}
-      <ScreenHead title="Duplicates" sub="Identical files, matched by content, not by name. We keep the newest copy and move the rest to the Trash.">
+      <ScanDetails task="dupes" />
+      <ScreenHead title="Duplicates" sub="Exact-content matches using whole-file hashes. Select groups explicitly, choose a keeper, and retain any extra copies you want. Removal is disabled.">
         {groups && groups.length > 0 && (
           <div className="fx-stat">
             <span>Wasted</span>
@@ -154,7 +161,7 @@ export default function Duplicates() {
                 <Icon name="dupes" />
               </span>
               <h3>Comparing your files</h3>
-              <p>{prog?.phase ? `${prog.phase}. ` : ''}We check contents byte by byte, so this can take a minute or two. Feel free to look around meanwhile.</p>
+              <p>{prog?.phase ? `${prog.phase}. ` : ''}We compare file sizes and content hashes. You can cancel the scan or switch screens.</p>
               <Progress value={prog && prog.total > 0 ? prog.done / prog.total : undefined} />
               {prog?.current && <div className="cur">{shortPath(prog.current, home)}</div>}
             </div>
@@ -164,7 +171,7 @@ export default function Duplicates() {
 
       {groups && groups.length === 0 && (
         <section className="card-w rise">
-          <Empty icon="check" title="No duplicates" text="Every file here is one of a kind. Nice and tidy." />
+          <Empty icon="check" title="No matching duplicates found" text="No matches were found within this scan’s folders, size threshold and exclusions. Review the scan summary for skipped or unreadable paths." />
         </section>
       )}
 
@@ -179,12 +186,14 @@ export default function Duplicates() {
               </div>
             </section>
           )}
+          <p>Select up to 200 groups / 10,000 copies per preview. Custom-folder matches may be discovery-only. <button className="btn small" onClick={() => setSkip(new Set(groups.map(g => g.hash)))}>Select no groups</button></p>
           <div className="fx-groups">
             {groups.slice(0, limit).map((g, i) => {
               const name = baseName(g.files[0].path);
               const keeper = keeperOf(g);
               const newest = newestPath(g);
-              const off = skip.has(g.hash);
+              const readOnly = g.files.some(f => f.removalEligible === false);
+              const off = skip.has(g.hash) || readOnly;
               return (
                 <section key={g.hash} className={`card-w fx-group rise${off ? ' skip' : ''}`} style={{ animationDelay: `${Math.min(i, 8) * 0.04}s` }}>
                   <div className="fx-group-head">
@@ -192,7 +201,7 @@ export default function Duplicates() {
                       type="checkbox"
                       className="check"
                       checked={!off}
-                      disabled={trashing}
+                      disabled={trashing || readOnly}
                       onChange={() => toggleGroup(g.hash)}
                       aria-label={`Include ${name}`}
                     />
@@ -210,7 +219,7 @@ export default function Duplicates() {
                         {name}
                       </div>
                       <div className="sub">
-                        {g.files.length} copies · {formatBytes(g.size)} each
+                        {g.files.length} copies · {formatBytes(g.size)} each {readOnly && '· Discovery only'}
                       </div>
                     </div>
                     <div className="fx-wasted">
@@ -220,7 +229,7 @@ export default function Duplicates() {
                   </div>
                   <div className="list fx-copies" role="radiogroup" aria-label={`Copy of ${name} to keep`}>
                     {g.files.map((f) => {
-                      const kept = f.path === keeper;
+                      const kept = f.path === keeper || retained.has(f.path);
                       const drive = driveOf(f.path, home, disks);
                       return (
                         <label key={f.path} className={`row${kept ? ' keep' : ''}`}>
@@ -228,7 +237,7 @@ export default function Duplicates() {
                             type="radio"
                             className="fx-radio"
                             name={`keep-${g.hash}`}
-                            checked={kept}
+                            checked={f.path === keeper}
                             disabled={trashing}
                             onChange={() => setKeep((k) => ({ ...k, [g.hash]: f.path }))}
                             aria-label="Keep this one"
@@ -249,6 +258,7 @@ export default function Duplicates() {
                               {f.path === newest && ' · newest'}
                             </div>
                           </div>
+                          {f.path !== keeper && <button type="button" className="btn small" disabled={trashing || readOnly} onClick={e => { e.preventDefault(); setRetained(r => { const n = new Set(r); if (n.has(f.path)) n.delete(f.path); else n.add(f.path); return n; }); }}>{retained.has(f.path) ? 'Allow preview' : 'Retain this copy'}</button>}
                           <span className={`fx-fate ${kept ? 'keep' : 'trash'}`}>{kept ? 'Keep' : off ? 'Leave' : 'To Trash'}</span>
                           <button
                             type="button"
@@ -291,7 +301,7 @@ export default function Duplicates() {
                 <button
                   type="button"
                   className="btn primary"
-                  disabled={trashing || loading}
+                  disabled={trashing || loading || n > 10000 || (groups.length - skip.size) > 200}
                   onClick={() => void trash()}
                 >
                   {trashing ? <span className="spinner" style={{ borderColor: 'rgba(255,255,255,0.35)', borderTopColor: '#fff' }} /> : <Icon name="trash" />}

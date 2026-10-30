@@ -1,3 +1,4 @@
+import { ScanDetails } from '../components/ScanDetails';
 import { useRemovalPreview } from '../components/RemovalPreview';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import type { IconName, LargeFile } from '../../shared/types';
@@ -40,23 +41,17 @@ const lastUsed = (f: LargeFile) => Math.max(f.accessed || 0, f.modified || 0);
 const parentDir = (p: string) => p.replace(/[\\/][^\\/]*$/, '');
 
 // results survive leaving the screen; the walk is not cheap
-let cache: { min: number; files: LargeFile[] } | null = null;
-let pending: { min: number; promise: Promise<LargeFile[]> } | null = null;
-
-function scan(min: number): Promise<LargeFile[]> {
-  if (pending && pending.min === min) return pending.promise;
-  const promise = api.scanLargeFiles(min).then(
-    (files) => {
-      cache = { min, files };
-      pending = null;
-      return files;
-    },
-    (e: unknown) => {
-      pending = null;
-      throw e;
-    },
-  );
-  pending = { min, promise };
+let cache: { key: string; files: LargeFile[] } | null = null;
+let pending: { key: string; promise: Promise<LargeFile[]> } | null = null;
+function scan(min: number, key: string): Promise<LargeFile[]> {
+  if (pending?.key === key) return pending.promise;
+  const previous = pending;
+  const promise = (async () => {
+    if (previous) { await api.cancelScan('large'); await previous.promise.catch(() => undefined); }
+    const files = await api.scanLargeFiles(min); cache = { key, files }; return files;
+  })();
+  pending = { key, promise };
+  void promise.finally(() => { if (pending?.promise === promise) pending = null; }).catch(() => undefined);
   return promise;
 }
 
@@ -64,7 +59,8 @@ export default function LargeFiles() {
   const { request: previewRemoval, dialog: removalDialog } = useRemovalPreview();
   const { settings, progress, system, disks, toast } = useStore();
   const min = settings ? settings.largeFileMinMb * MB : null;
-  const [files, setFiles] = useState<LargeFile[] | null>(cache && cache.min === min ? cache.files : null);
+  const scanKey = settings ? JSON.stringify([min, settings.scanRoots, settings.excludedPaths, settings.includeHidden]) : '';
+  const [files, setFiles] = useState<LargeFile[] | null>(cache && cache.key === scanKey ? cache.files : null);
   const [loading, setLoading] = useState(false);
   const [failed, setFailed] = useState(false);
   const [filter, setFilter] = useState<Filter>('all');
@@ -78,15 +74,16 @@ export default function LargeFiles() {
   const load = useCallback(
     async (force = false) => {
       if (min === null) return;
-      if (!force && cache && cache.min === min) {
+      if (!force && cache && cache.key === scanKey) {
         setFiles(cache.files);
         return;
       }
       if (force) cache = null;
+      setFiles(null);
       setLoading(true);
       setFailed(false);
       try {
-        const next = await scan(min);
+        const next = await scan(min, scanKey);
         setFiles(next);
         setSelected(new Set());
       } catch (e) {
@@ -96,7 +93,7 @@ export default function LargeFiles() {
         setLoading(false);
       }
     },
-    [min, toast],
+    [min, toast, scanKey],
   );
 
   useEffect(() => {
@@ -120,10 +117,11 @@ export default function LargeFiles() {
   const icons = useFileIcons(shown.map((f) => f.path));
   const otherDrives = (disks?.length ?? 0) > 1;
 
-  const chosen = (files ?? []).filter((f) => selected.has(f.path));
+  const chosen = (files ?? []).filter((f) => selected.has(f.path) && f.removalEligible !== false);
   const chosenSize = sum(chosen.map((f) => f.size));
   const totalSize = sum((files ?? []).map((f) => f.size));
-  const shownAllOn = shown.length > 0 && shown.every((f) => selected.has(f.path));
+  const selectable = shown.filter(f => f.removalEligible !== false);
+  const shownAllOn = selectable.length > 0 && selectable.every((f) => selected.has(f.path));
 
   const toggle = (path: string) =>
     setSelected((s) => {
@@ -137,6 +135,7 @@ export default function LargeFiles() {
     setSelected((s) => {
       const n = new Set(s);
       for (const f of shown) {
+        if (f.removalEligible === false) continue;
         if (shownAllOn) n.delete(f.path);
         else n.add(f.path);
       }
@@ -157,9 +156,10 @@ export default function LargeFiles() {
   return (
     <div className="screen">
       {removalDialog}
+      <ScanDetails task="large" />
       <ScreenHead
         title="Large Files"
-        sub={`Files over ${settings ? formatBytes(settings.largeFileMinMb * MB) : '…'} in ordinary personal folders. Application data and credential stores are excluded.`}
+        sub={`Files over ${settings ? formatBytes(settings.largeFileMinMb * MB) : '…'} in your selected scan folders. Protected application and credential data are excluded.`}
       >
         {files && files.length > 0 && (
           <div className="fx-stat">
@@ -246,7 +246,7 @@ export default function LargeFiles() {
                 {shown.length} · {formatBytes(sum(shown.map((f) => f.size)))}
               </span>
               <span className="grow" />
-              <button type="button" className="fx-link" onClick={toggleShown} disabled={!shown.length || trashing}>
+              <button type="button" className="fx-link" onClick={toggleShown} disabled={!selectable.length || trashing}>
                 {shownAllOn ? 'Select none' : 'Select all'}
               </button>
             </div>
@@ -260,7 +260,7 @@ export default function LargeFiles() {
                   const drive = driveOf(f.path, home, disks);
                   return (
                     <label key={f.path} className={`row${on ? ' on' : ''}`}>
-                      <input type="checkbox" className="check" checked={on} disabled={trashing} onChange={() => toggle(f.path)} aria-label={f.name} />
+                      <input type="checkbox" className="check" checked={on} disabled={trashing || f.removalEligible === false} onChange={() => toggle(f.path)} aria-label={f.name} />
                       {icons[f.path] ? (
                         <span className="chip-ico real">
                           <img src={icons[f.path]} alt="" draggable={false} />
@@ -272,7 +272,7 @@ export default function LargeFiles() {
                       )}
                       <div className="grow">
                         <div className="title" title={f.name}>
-                          {f.name}
+                          {f.name} {f.removalEligible === false && '· Discovery only'}
                         </div>
                         <div className="sub mono" title={f.path}>
                           {drive ? (

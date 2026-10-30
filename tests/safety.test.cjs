@@ -6,6 +6,14 @@ const path = require('node:path');
 const os = require('node:os');
 const crypto = require('node:crypto');
 const loadTs = require('./load-ts.cjs');
+const { EventEmitter } = require('node:events');
+
+const localAttributes = { spawn: () => {
+  const child = new EventEmitter(); child.stdout = new EventEmitter(); child.stdout.setEncoding = () => {};
+  child.stdin = new EventEmitter(); child.kill = () => {};
+  child.stdin.end = input => queueMicrotask(() => { child.stdout.emit('data', input.split('\n').map(() => '0').join('\n')); child.emit('close', 0); });
+  return child;
+} };
 
 async function fixture(t, extra = {}) {
   const workspaceFixtures = path.resolve(__dirname, '..', '.test-fixtures');
@@ -318,4 +326,138 @@ test('large-file scan excludes mail, package data and credentials; partial resul
 test('installer packaging hook fails closed', () => {
   const gate = require('../scripts/check-release.cjs');
   assert.throws(gate, /Packaging blocked/);
+});
+
+test('custom discovery scope finds small duplicates without widening removal permissions', async t => {
+  const f = await fixture(t, { 'node:child_process': localAttributes });
+  const a = await f.write('Collection/a.txt', 'identical small content');
+  const b = await f.write('Collection/b.txt', 'identical small content');
+  await f.write('Collection/.hidden.txt', 'identical small content');
+  await f.write('Collection/mail.pst', 'identical small content');
+  await f.write('Documents/outside.txt', 'identical small content');
+  const options = { roots: [path.dirname(a)], exclusions: [], minBytes: 1, includeHidden: false };
+  const events = []; const scan = f.load('electron/services/duplicates.ts').scanDuplicates;
+  const groups = await scan(e => events.push(e), options);
+  assert.equal(groups.length, 1); assert.equal(groups[0].files.length, 2);
+  assert.ok(groups[0].files.every(i => i.removalEligible === false));
+  assert.equal(events.at(-1).summary.matched, 1); assert.ok(events.at(-1).summary.skipped >= 2);
+  await assert.rejects(() => f.load('electron/services/plans.ts').previewTrash([a]), /ordinary personal/);
+  assert.equal((await scan(() => {}, { ...options, exclusions: [b] })).length, 0);
+  assert.equal((await scan(() => {}, { ...options, includeHidden: true }))[0].files.length, 3);
+  assert.equal((await scan(() => {}, { ...options, minBytes: 1024 })).length, 0);
+});
+
+test('duplicate scanner returns more than 200 groups and distinguishes same-size different content', async t => {
+  const f = await fixture(t, { 'node:child_process': localAttributes });
+  for (let i = 0; i < 201; i++) {
+    const data = `content ${String(i).padStart(4, '0')}`;
+    await f.write(`Documents/a-${i}.txt`, data); await f.write(`Downloads/b-${i}.txt`, data);
+  }
+  const events = [];
+  const groups = await f.load('electron/services/duplicates.ts').scanDuplicates(e => events.push(e), {
+    roots: [path.join(f.root, 'Documents'), path.join(f.root, 'Downloads')], exclusions: [], minBytes: 1, includeHidden: false,
+  });
+  assert.equal(groups.length, 201); assert.ok(groups.every(g => g.files.length === 2));
+  assert.equal(events.at(-1).summary.limited, false);
+});
+
+test('discovery settings persist and reject unsafe roots and invalid thresholds', async t => {
+  const f = await fixture(t); const settings = f.load('electron/services/settings.ts');
+  const root = path.join(f.root, 'Collection'); await fsp.mkdir(root);
+  const ignore = path.join(root, 'ignored');
+  await settings.setSettings({ scanRoots: [root], excludedPaths: [ignore], duplicateMinBytes: 1, includeHidden: true });
+  const fresh = loadTs({ electron: f.electron })('electron/services/settings.ts');
+  const saved = await fresh.getSettings();
+  assert.deepEqual(saved.scanRoots, [root]); assert.deepEqual(saved.excludedPaths, [ignore]); assert.equal(saved.duplicateMinBytes, 1); assert.equal(saved.includeHidden, true);
+  for (const patch of [{ duplicateMinBytes: 0 }, { duplicateMinBytes: NaN }, { scanRoots: [path.parse(root).root] }, { scanRoots: [path.join(root, '.ssh')] }, { excludedPaths: ['relative'] }]) await assert.rejects(() => settings.setSettings(patch));
+});
+
+test('scan jobs cancel across callers and reject overlapping jobs of the same kind', async () => {
+  const { ScanJobs, checkCancelled } = loadTs()('electron/services/scanJobs.ts'); const jobs = new ScanJobs();
+  let finish; let received;
+  const promise = jobs.run('dupes', async signal => { received = signal; await new Promise(r => { finish = r; }); checkCancelled(signal); });
+  await assert.rejects(() => jobs.run('dupes', async () => {}), /already running/);
+  assert.equal(jobs.cancel('dupes'), true); assert.equal(received.aborted, true); finish();
+  await assert.rejects(() => promise, /cancelled/); assert.equal(jobs.cancel('dupes'), false);
+  assert.equal(await jobs.run('dupes', async () => 123), 123);
+});
+
+test('cancelled discovery returns an explicitly partial summary without scanning files', async t => {
+  const f = await fixture(t); const ctrl = new AbortController(); ctrl.abort();
+  const options = { roots: [f.root], exclusions: [], minBytes: 1, includeHidden: false };
+  for (const [file, run] of [['duplicates.ts', 'scanDuplicates'], ['largeFiles.ts', 'scanLargeFiles']]) {
+    const events = []; const service = f.load('electron/services/' + file);
+    const result = run === 'scanDuplicates' ? await service[run](e => events.push(e), options, ctrl.signal) : await service[run](1, e => events.push(e), options, ctrl.signal);
+    assert.deepEqual(result, []); assert.equal(events.at(-1).summary.cancelled, true); assert.match(events.at(-1).warning, /partial/);
+  }
+});
+
+test('revised previews cannot add paths, reject stale identities and invalidate the old token', async t => {
+  const f = await fixture(t); const a = await f.write('Downloads/a.txt'); const b = await f.write('Downloads/b.txt');
+  const p = f.load('electron/services/plans.ts'); const plan = await p.previewTrash([a,b]);
+  await assert.rejects(() => p.revisePlan(plan.id, [path.join(f.root, 'Downloads/forged')]), /cannot add/);
+  const revised = await p.revisePlan(plan.id, [a]); assert.deepEqual(revised.items.map(i => i.path), [a]);
+  await assert.rejects(() => p.revisePlan(plan.id, [a]), /expired/);
+  await fsp.writeFile(a, 'changed'); await assert.rejects(() => p.revisePlan(revised.id, [a]), /Stale/);
+  const another = await p.previewTrash([b]);
+  assert.deepEqual((await p.revisePlan(another.id, [])).items, []);
+  await assert.rejects(() => p.revisePlan(another.id, [b]), /expired/);
+});
+
+test('cleanup batching processes large inventories with disjoint single-use pages and saved exclusions', async t => {
+  const f = await fixture(t); const recorded = [];
+  const adapter = { plannedItem: async (p, action) => ({ identity: { path: p, size: 1, directory: false }, action }), removalPlans: { create: (items, _keepers, batch) => { recorded.push(items); return { id: 'test', items: items.map(i => ({ path: i.identity.path })), batch }; } } };
+  const load = loadTs({ './plans': adapter }); const batches = load('electron/services/cleanupBatches.ts');
+  const inventory = Array.from({ length: 10001 }, (_,i) => ({ path: path.join(f.root, `file-${i}.tmp`), action: 'delete' }));
+  const cursor = batches.startCleanupBatches(inventory, ['browser-cache'], false);
+  inventory[0].path = 'tampered';
+  const first = await batches.nextCleanupBatch(cursor, ['browser-cache'], []);
+  assert.equal(first.items.length, 500); assert.equal(first.batch.remaining, 9501); assert.notEqual(first.items[0].path, 'tampered');
+  await assert.rejects(() => batches.nextCleanupBatch(cursor, ['browser-cache'], []), /expired/);
+  const ignored = path.join(f.root, 'file-500.tmp');
+  const second = await batches.nextCleanupBatch(first.batch.cursor, ['browser-cache'], [ignored]);
+  assert.equal(second.items.length, 500); assert.equal(second.batch.skipped, 1);
+  assert.ok(second.items.every(i => !first.items.some(j => i.path === j.path) && i.path !== ignored));
+  assert.equal(recorded.length, 2);
+});
+
+test('cleanup exclusions affect scan totals and exact preview candidates', async t => {
+  const f = await fixture(t);
+  const root = process.platform === 'win32' ? 'AppData/Local/Google/Chrome/User Data/Default/Cache' : 'Library/Application Support/Google/Chrome/Default/Cache';
+  const keep = await f.write(root + '/keep.bin', 'keep'); const candidate = await f.write(root + '/candidate.bin', 'candidate');
+  const load = process.platform === 'win32' ? f.load : loadTs({ electron: f.electron, 'node:os': { ...os, homedir: () => f.root } }, 'darwin');
+  const junk = load('electron/services/junk.ts');
+  const result = await junk.scanJunk(() => {}, [keep]);
+  assert.equal(result.find(c => c.id === 'browser-cache').size, Buffer.byteLength('candidate'));
+  const plan = await junk.previewJunk(['browser-cache'], undefined, [keep]);
+  assert.deepEqual(plan.items.map(i => i.path), [candidate]);
+  const controller = new AbortController(); controller.abort();
+  await assert.rejects(() => junk.previewJunk(['browser-cache'], undefined, [], controller.signal), /cancelled/);
+});
+
+test('cancellation interrupts content hashing and reports partial duplicate results', async t => {
+  const ctrl = new AbortController(); let streams = 0;
+  const f = await fixture(t, { 'node:child_process': localAttributes, 'node:fs': { ...fs, createReadStream: (p, options) => {
+    streams++; const stream = fs.createReadStream(p, options); stream.once('data', () => ctrl.abort()); return stream;
+  } } });
+  await f.write('Downloads/a.bin', Buffer.alloc(256 * 1024, 1)); await f.write('Documents/b.bin', Buffer.alloc(256 * 1024, 1));
+  const events = [];
+  await f.load('electron/services/duplicates.ts').scanDuplicates(p => events.push(p), {
+    roots: [path.join(f.root, 'Downloads'), path.join(f.root, 'Documents')], exclusions: [], minBytes: 1, includeHidden: false,
+  }, ctrl.signal);
+  assert.ok(streams > 0); assert.equal(events.at(-1).summary.cancelled, true); assert.equal(events.at(-1).summary.partial, true);
+});
+
+test('later exclusions inside an old-download folder prevent that folder entering a cleanup batch', async t => {
+  const f = await fixture(t); const folder = path.join(f.root, 'Downloads/archive');
+  const child = await f.write('Downloads/archive/important.txt'); const file = await f.write('Downloads/other.txt');
+  const batches = f.load('electron/services/cleanupBatches.ts');
+  const cursor = batches.startCleanupBatches([{ path: folder, action: 'trash' }, { path: file, action: 'trash' }], ['old-downloads'], false);
+  const result = await batches.nextCleanupBatch(cursor, ['old-downloads'], [child]);
+  assert.equal(result.batch.skipped, 1); assert.deepEqual(result.items.map(i => i.path), [file]);
+});
+
+test('space-map cancellation exits before invoking disk services', async t => {
+  const f = await fixture(t); const ctrl = new AbortController(); ctrl.abort();
+  await assert.rejects(() => f.load('electron/services/spaces.ts').scanSpaces(() => {}, undefined, ctrl.signal), /cancelled/);
 });

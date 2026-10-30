@@ -1,8 +1,9 @@
 import { useState } from 'react';
+import { DiscoverySettings } from '../components/DiscoverySettings';
 import type { AiProvider, Background, Settings as SettingsData } from '../../shared/types';
 import { api } from '../api';
 import { BrandMark, Icon } from '../components/Icon';
-import { ScreenHead, Segmented, Toggle } from '../components/ui';
+import { ScreenHead, Segmented } from '../components/ui';
 import { useStore } from '../state';
 import './system.css';
 
@@ -151,6 +152,7 @@ export default function Settings() {
       <ScreenHead title="Settings" sub="Make Cleanly feel like yours. Changes save right away." />
 
       <div className="sy-settings sy-stagger">
+        <DiscoverySettings />
         <section className="card-w panel">
           <div className="sy-set-head">
             <span className="chip-ico">
@@ -198,15 +200,9 @@ export default function Settings() {
           </div>
           <div className="sy-opt">
             <div className="grow">
-              <b>Ask before cleaning</b>
-              <small>Show what will be removed and wait for your OK</small>
+              <b>Preview and confirmation are always required</b>
+              <small>Removal remains disabled in this development build.</small>
             </div>
-            {spin('confirm')}
-            <Toggle
-              checked={settings.confirmBeforeClean}
-              label="Ask before cleaning"
-              onChange={(v) => void save('confirm', { confirmBeforeClean: v })}
-            />
           </div>
           <div className="sy-opt col">
             <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
@@ -224,7 +220,7 @@ export default function Settings() {
             />
           </div>
           <p className="sy-note" style={{ margin: '6px 0 0' }}>
-            Caches and temporary files are deleted for good. Your own files always go to the Trash, so you can restore them.
+            Previews distinguish permanent cache deletion from moving personal files to Trash. Nothing is removed while the development safety lock is active.
           </p>
         </section>
 

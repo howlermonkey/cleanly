@@ -1,4 +1,5 @@
 import type { ComponentType } from 'react';
+import { api } from './api';
 import { SAFETY_NOTICE } from '../shared/safety';
 import { Flow } from './components/Flow';
 import { Icon, IconSprite } from './components/Icon';
@@ -34,7 +35,7 @@ const SCREENS: Record<Screen, ComponentType> = {
 };
 
 function Shell() {
-  const { screen, settings, toasts, scanWarnings } = useStore();
+  const { screen, settings, toasts, scanWarnings, activeScans, toast } = useStore();
   const bg = settings?.background ?? 'mist';
   const Current = SCREENS[screen];
 
@@ -55,6 +56,7 @@ function Shell() {
       {bg === 'grain' && <div className="bg-layer bg-grain" />}
       <Titlebar />
       <div role="status" className="safety-notice">{SAFETY_NOTICE}</div>
+      {activeScans.length > 0 && <div className="safety-notice" role="status">Running scans: {activeScans.map(task => <button key={task} className="btn small" onClick={() => void api.cancelScan(task).catch(e => toast(String(e), 'err'))}>Cancel {task === 'dupes' ? 'duplicates' : task === 'junk' ? 'cleanup' : task === 'large' ? 'large files' : task === 'spaces' ? 'space map' : 'preview'}</button>)}</div>}
       {Object.entries(scanWarnings).filter(([,message]) => message).map(([task,message]) => <div className="safety-notice" role="status" key={task}>{message}</div>)}
       <div className="body">
         <Sidebar />

@@ -19,6 +19,8 @@ npm run demo
 
 ## Safety changes
 
+The [discovery and review guide](DISCOVERY.md) describes custom scan folders, saved exclusions, duplicate thresholds, cancellation, scan summaries and 500-item cleanup batches.
+
 - File removal uses immutable, expiring, single-use manifests held in the main process. Previews list every selected path and whether the planned action is permanent deletion or Trash.
 - Filesystem identities and duplicate keeper content are revalidated. Incomplete folder scans, changed files and linked ancestors reject approval. Permanent directory-wide deletion and bin-emptying have been removed from the execution flow.
 - Large Files and Duplicates default to OS-known personal folders, including supported folder redirection. Application databases, credential stores and package contents are excluded.

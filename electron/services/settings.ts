@@ -3,6 +3,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import type { AiProvider, Background, Settings } from '../../shared/types';
 import { transactionQueue } from './mutations';
+import { localPath, validScanRoot } from './discovery';
 
 const transaction = transactionQueue();
 
@@ -14,6 +15,10 @@ const DEFAULTS: StoredSettings = {
   background: 'mist',
   largeFileMinMb: 500,
   confirmBeforeClean: true,
+  scanRoots: [],
+  excludedPaths: [],
+  duplicateMinBytes: 1024 * 1024,
+  includeHidden: false,
 };
 
 const PROVIDERS: readonly AiProvider[] = ['claude', 'chatgpt'];
@@ -58,6 +63,20 @@ function validatePatch(patch: unknown): Partial<StoredSettings> {
   const out: Partial<StoredSettings> = {};
   for (const [key, value] of Object.entries(patch)) {
     switch (key) {
+      case 'scanRoots':
+      case 'excludedPaths': {
+        if (!Array.isArray(value) || value.length > (key === 'scanRoots' ? 100 : 1000) || value.some(p => !(key === 'scanRoots' ? validScanRoot(p) : localPath(p)))) throw new Error('Choose up to 100 ordinary scan folders or 1,000 local exclusions. System, home and drive roots cannot be scan folders.');
+        out[key] = [...new Set((value as string[]).map(p => path.resolve(p)))];
+        break;
+      }
+      case 'duplicateMinBytes':
+        if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 1 || value > 1024 ** 4) throw new Error('Duplicate minimum must be between 1 byte and 1 TB');
+        out.duplicateMinBytes = value;
+        break;
+      case 'includeHidden':
+        if (typeof value !== 'boolean') throw new Error('Hidden files setting must be on or off');
+        out.includeHidden = value;
+        break;
       case 'aiProvider':
         if (!PROVIDERS.includes(value as AiProvider)) throw new Error('Unknown assistant provider.');
         out.aiProvider = value as AiProvider;

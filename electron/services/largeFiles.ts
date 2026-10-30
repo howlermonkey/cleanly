@@ -1,7 +1,9 @@
 import os from 'node:os';
 import path from 'node:path';
 import type { LargeFile, ScanProgress } from '../../shared/types';
-import { personalRoots, isPersonalPath } from './personalPolicy';
+import { isPersonalPath } from './personalPolicy';
+import { discoveryOptions, discoverable, excluded } from './discovery';
+import type { ScanSummary } from '../../shared/types';
 import { displayPath, isInside, localAppData, walk, incompleteWalk, type WalkFile } from './walk';
 
 type Progress = (p: ScanProgress) => void;
@@ -36,7 +38,9 @@ const CACHE_DIRS = new Set([
 const TOTAL_ENTRIES = 4_000_000;
 
 /** Biggest ordinary files in the OS-known personal folders, at least minBytes each. */
-export async function scanLargeFiles(minBytes: unknown, progress: Progress): Promise<LargeFile[]> {
+export async function scanLargeFiles(minBytes: unknown, progress: Progress, options = discoveryOptions(), signal?: AbortSignal): Promise<LargeFile[]> {
+  const summary: ScanSummary = { roots: options.roots, visited: 0, skipped: 0, unreadable: 0, matched: 0, limited: false, cancelled: false,
+    notes: ['Largest 300 matching files. Protected paths and links excluded. Extra folders are discovery-only.', options.exclusions.length + ' saved exclusions. Hidden names ' + (options.includeHidden ? 'included.' : 'excluded.')] };
   const n = Number(minBytes);
   const min = Number.isFinite(n) && n >= MB ? n : 100 * MB;
   const home = os.homedir();
@@ -65,8 +69,8 @@ export async function scanLargeFiles(minBytes: unknown, progress: Progress): Pro
   progress({ task: 'large', phase: homePhase, done: 0, total: 0 });
 
   const collect = (f: WalkFile) => {
-    if (f.size < min || !isPersonalPath(f.path)) return;
-    found.push({ path: f.path, name: f.name, size: f.size, modified: f.mtimeMs, accessed: f.atimeMs, kind: kindOf(f.name) });
+    if (f.size < min || !discoverable(f.path, options) || (!options.includeHidden && f.name.startsWith('.'))) { summary.skipped++; return; }
+    found.push({ path: f.path, name: f.name, size: f.size, modified: f.mtimeMs, accessed: f.atimeMs, kind: kindOf(f.name), removalEligible: isPersonalPath(f.path) });
     if (found.length > MAX_RESULTS * 10) trim();
   };
   const ticker = (phase: string) => (entries: number, current: string) => {
@@ -76,21 +80,31 @@ export async function scanLargeFiles(minBytes: unknown, progress: Progress): Pro
     progress({ task: 'large', phase, done: seen + entries, total: 0, current: displayPath(current) });
   };
 
-  const roots = personalRoots().filter((r, i, all) => !all.some((other,j) => i !== j && isInside(other,r)));
+  const roots = options.roots;
   for (const root of roots) {
+    if (signal?.aborted) break;
+    if (excluded(root, options.exclusions)) { summary.skipped++; continue; }
     const budget = Math.min(MAX_ENTRIES, TOTAL_ENTRIES - seen);
     if (budget <= 0) { limited = true; break; }
     const stats = await walk(root, {
       maxEntries: budget,
-      skipDir: (p, name) => !isPersonalPath(p) || skipSet.has(p.toLowerCase()) || (CACHE_DIRS.has(name.toLowerCase()) && isInside(appData,p)),
+      signal,
+      skipDir: (p, name) => {
+        const skip = !discoverable(p, options) || (!options.includeHidden && name.startsWith('.')) || skipSet.has(p.toLowerCase()) || (CACHE_DIRS.has(name.toLowerCase()) && isInside(appData,p));
+        if (skip) summary.skipped++;
+        return skip;
+      },
       onFile: collect,
       onTick: ticker(homePhase),
     });
     if (incompleteWalk(stats)) limited = true;
+    summary.unreadable += stats.unreadable;
+    summary.skipped += stats.linked;
     seen += stats.files + stats.dirs;
   }
 
   trim();
-  progress({ task: 'large', phase: 'Done', done: found.length, total: found.length, warning: limited ? 'Large Files is partial: inaccessible entries or scan/result limits were reached. Only ordinary personal folders are included.' : '' });
+  Object.assign(summary, { visited: seen, matched: found.length, limited, cancelled: Boolean(signal?.aborted) });
+  progress({ task: 'large', phase: signal?.aborted ? 'Cancelled' : 'Done', done: found.length, total: found.length, summary, warning: limited || signal?.aborted ? 'Large Files is partial: inaccessible paths, cancellation or scan/result limits.' : '' });
   return found;
 }

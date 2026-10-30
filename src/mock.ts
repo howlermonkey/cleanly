@@ -420,6 +420,7 @@ function initialSettings(): Settings {
     background: 'mist',
     largeFileMinMb: 500,
     confirmBeforeClean: true,
+    scanRoots: [], excludedPaths: [], duplicateMinBytes: 1024 ** 2, includeHidden: false,
   };
 }
 
@@ -440,6 +441,9 @@ function removeFromTree(node: SpaceNode, path: string, bytes: number): boolean {
 
 export function createMockApi(): CleanlyApi {
   const listeners = new Set<(p: ScanProgress) => void>();
+  const running = new Set<string>();
+  const cancelled = new Set<string>();
+  const demoPlans = new Map<string, import('../shared/types').RemovalPlan>();
   const emit = (p: ScanProgress) => listeners.forEach((cb) => cb(p));
 
   let junk = initialJunk();
@@ -469,12 +473,19 @@ export function createMockApi(): CleanlyApi {
 
   /** Steps through phases with small pauses, emitting progress as it goes. */
   async function walk(task: ScanProgress['task'], phases: { phase: string; current?: string }[], totalMs: number) {
+    const cancellable = ['junk', 'dupes', 'large', 'spaces', 'preview'].includes(task);
+    running.add(task); cancelled.delete(task);
+    emit({ task, phase: 'Starting', done: 0, total: phases.length, running: cancellable ? true : undefined, warning: '' });
     const step = totalMs / Math.max(1, phases.length);
     for (let i = 0; i < phases.length; i++) {
+      if (cancelled.has(task)) break;
       emit({ task, phase: phases[i].phase, done: i, total: phases.length, current: phases[i].current });
       await new Promise((r) => setTimeout(r, step * (0.7 + Math.random() * 0.6)));
     }
-    emit({ task, phase: 'Done', done: phases.length, total: phases.length });
+    running.delete(task);
+    emit({ task, phase: cancelled.has(task) ? 'Cancelled' : 'Done', done: phases.length, total: phases.length, running: cancellable ? false : undefined,
+      warning: cancelled.has(task) ? 'Demo scan cancelled' : '', summary: { roots: settings.scanRoots.length ? settings.scanRoots : [HOME], visited: 0, skipped: 0, unreadable: 0, matched: 0, limited: false, cancelled: cancelled.has(task), notes: ['Synthetic demonstration only. Scan settings do not scan real folders in the browser.'] } });
+    if (cancelled.has(task)) throw new Error('Demo scan cancelled');
   }
 
   function sizeOf(path: string): number {
@@ -493,15 +504,25 @@ export function createMockApi(): CleanlyApi {
     return find(onD(path) ? treeD : tree);
   }
 
+  const demoPlan = (items: import('../shared/types').RemovalPlan['items']) => {
+    const plan = { id: crypto.randomUUID(), expiresAt: Date.now() + 300_000, items }; demoPlans.set(plan.id, plan); return clone(plan);
+  };
   return {
+    async chooseFolder() { throw new Error('Folder selection requires the desktop app'); },
+    async cancelScan(task) { if (!running.has(task)) return false; cancelled.add(task); return true; },
+    async revisePlan(id, paths) {
+      const plan = demoPlans.get(id); if (!plan) throw new Error('Preview expired');
+      if (paths.some(p => !plan.items.some(i => i.path === p))) throw new Error('Cannot add paths');
+      demoPlans.delete(id); return demoPlan(plan.items.filter(i => paths.includes(i.path)));
+    },
     async previewJunk(ids) {
-      return { id: 'demo', expiresAt: Date.now() + 300_000, items: junk.filter(c => ids.includes(c.id)).map(c => ({ path: `Demo: ${c.name}`, size: c.size, action: 'delete' as const })) };
+      return demoPlan(junk.filter(c => ids.includes(c.id)).map(c => ({ path: `Demo: ${c.name}`, size: c.size, action: 'delete' as const })));
     },
     async previewTrash(paths) {
-      return { id: 'demo', expiresAt: Date.now() + 300_000, items: paths.map(path => ({ path, size: 0, action: 'trash' as const })) };
+      return demoPlan(paths.map(path => ({ path, size: 0, action: 'trash' as const })));
     },
     async previewDuplicates(groups) {
-      return { id: 'demo', expiresAt: Date.now() + 300_000, items: groups.flatMap(g => g.remove.map(path => ({ path, size: 0, action: 'trash' as const }))) };
+      return demoPlan(groups.flatMap(g => g.remove.map(path => ({ path, size: 0, action: 'trash' as const }))));
     },
     async executePlan() { throw new Error('Removal is disabled in the development preview'); },
     async system() {

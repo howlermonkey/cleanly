@@ -1,3 +1,4 @@
+import { ScanDetails } from '../components/ScanDetails';
 import { api } from '../api';
 import { useRemovalPreview } from '../components/RemovalPreview';
 import { useEffect, useMemo, useRef, useState } from 'react';
@@ -49,7 +50,7 @@ export default function Cleanup() {
 
   const toggleAll = () => setSelected(allOn ? new Set() : new Set(cleanable.map((c) => c.id)));
 
-  const run = () => previewRemoval(() => api.previewJunk(chosen.map(c => c.id)));
+  const run = () => { const ids = chosen.map(c => c.id); return previewRemoval(() => api.previewJunk(ids), undefined, cursor => api.previewJunk(ids, cursor)); };
   const start = () => { if (chosen.length) void run(); };
 
   const big = splitBytes(total);
@@ -57,6 +58,7 @@ export default function Cleanup() {
   return (
     <div className="screen">
       {removalDialog}
+      <ScanDetails task="junk" />
       <ScreenHead title="Cleanup" sub="Inspect cleanup candidates and preview exact paths. Removal is disabled in this development build.">
         <div className="fx-head-actions">
           <button type="button" className="btn small" onClick={() => void smartScan()} disabled={scanning || cleaning}>

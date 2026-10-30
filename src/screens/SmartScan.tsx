@@ -157,7 +157,7 @@ export default function SmartScan() {
   const canClean = !scanning && !cleaning && safeIds.length > 0;
 
   const clean = async () => {
-    if (canClean) await previewRemoval(() => api.previewJunk(safeIds));
+    if (canClean) await previewRemoval(() => api.previewJunk(safeIds), undefined, cursor => api.previewJunk(safeIds, cursor));
   };
 
   const rescan = useCallback(() => {

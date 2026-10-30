@@ -2,6 +2,8 @@
 
 Status: development-only, destructive features and packaging remain disabled.
 
+The subsequent [discovery milestone](DISCOVERY.md) adds configurable read-only scope and cancellable review workflows. It does not complete or waive any native mutation/release gate below. Cleanup now uses a bounded candidate inventory and 500-item pages rather than rejecting an entire category at 10,000 entries.
+
 ## Completed local validation
 
 - Windows, Node 22: all 26 safety regression tests passed with no skipped tests, including real junction/hardlink fixtures.

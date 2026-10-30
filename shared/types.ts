@@ -26,12 +26,28 @@ export interface DiskInfo {
 }
 
 export interface ScanProgress {
-  task: 'junk' | 'spaces' | 'large' | 'dupes' | 'clean' | 'apps';
+  task: 'junk' | 'spaces' | 'large' | 'dupes' | 'clean' | 'apps' | 'preview';
   phase: string;        // human readable, e.g. "Browser caches"
   done: number;
   total: number;        // 0 when unknown
   current?: string;     // path being looked at
   warning?: string;     // incomplete/limited results; empty string clears a previous warning
+  running?: boolean;
+  summary?: ScanSummary;
+}
+
+export type ScanTask = 'junk' | 'large' | 'dupes' | 'preview' | 'spaces';
+export interface DiscoveryOptions { roots: string[]; exclusions: string[]; minBytes: number; includeHidden: boolean }
+export interface ScanSummary {
+  roots: string[];
+  visited: number;
+  skipped: number;
+  unreadable: number;
+  matched: number;
+  limited: boolean;
+  cancelled: boolean;
+  partial?: boolean;
+  notes: string[];
 }
 
 /** A group of junk the app knows how to clean, e.g. "Browser caches". */
@@ -62,6 +78,7 @@ export interface RemovalPlan {
   id: string;
   expiresAt: number;
   items: { path: string; size: number; action: RemovalAction }[];
+  batch?: { cursor?: string; remaining: number; skipped: number; limited: boolean };
 }
 export interface DuplicateSelection { hash: string; keeper: string; remove: string[] }
 
@@ -76,6 +93,7 @@ export interface SpaceNode {
 }
 
 export interface LargeFile {
+  removalEligible?: boolean;
   path: string;
   name: string;
   size: number;
@@ -87,7 +105,7 @@ export interface LargeFile {
 export interface DuplicateGroup {
   hash: string;
   size: number;           // size of one copy
-  files: { path: string; modified: number }[];
+  files: { path: string; modified: number; removalEligible?: boolean }[];
 }
 
 export interface StartupItem {
@@ -137,6 +155,10 @@ export interface Settings {
   background: Background;
   largeFileMinMb: number;
   confirmBeforeClean: boolean;
+  scanRoots: string[];
+  excludedPaths: string[];
+  duplicateMinBytes: number;
+  includeHidden: boolean;
 }
 
 /** What the assistant may see: names, paths and sizes only, never file contents. */
@@ -194,7 +216,10 @@ export interface CleanlyApi {
   fileIcons(paths: string[]): Promise<Record<string, string>>;
   scanJunk(): Promise<JunkCategory[]>;
   cleanJunk(ids: string[]): Promise<CleanResult>;
-  previewJunk(ids: string[]): Promise<RemovalPlan>;
+  previewJunk(ids: string[], cursor?: string): Promise<RemovalPlan>;
+  revisePlan(id: string, keepPaths: string[]): Promise<RemovalPlan>;
+  chooseFolder(): Promise<string | null>;
+  cancelScan(task: ScanTask): Promise<boolean>;
   previewTrash(paths: string[]): Promise<RemovalPlan>;
   previewDuplicates(groups: DuplicateSelection[]): Promise<RemovalPlan>;
   executePlan(id: string): Promise<CleanResult>;
@@ -226,6 +251,7 @@ export const API_METHODS = [
   'system', 'disk', 'disks', 'fileIcons', 'scanJunk', 'cleanJunk', 'scanSpaces', 'scanLargeFiles', 'scanDuplicates', 'trashPaths',
   'revealPath', 'startupItems', 'setStartupItem', 'installedApps', 'uninstallApp', 'protection', 'getSettings',
   'previewJunk', 'previewTrash', 'previewDuplicates', 'executePlan',
+  'revisePlan', 'chooseFolder', 'cancelScan',
   'setSettings', 'setApiKey', 'askAi', 'tipsProfile', 'startTip', 'sendFeedback', 'openExternal',
 ] as const satisfies readonly Exclude<keyof CleanlyApi, 'onProgress'>[];
 

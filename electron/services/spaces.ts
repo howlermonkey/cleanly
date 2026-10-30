@@ -3,6 +3,7 @@ import { promises as fsp } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import type { DiskInfo, IconName, ScanProgress, SpaceNode } from '../../shared/types';
+import { checkCancelled } from './scanJobs';
 import { getDisk, listDisks, sameMount } from './disk';
 import { DAY_MS, displayPath, isInside, knownFolders, samePath, walk, incompleteWalk } from './walk';
 
@@ -106,9 +107,10 @@ class Scan {
   readonly cutoff = Date.now() - OLD_MS;
   readonly known = knownFolders();
 
-  constructor(private readonly progress: Progress) {}
+  constructor(private readonly progress: Progress, readonly signal?: AbortSignal) {}
 
   step(phase: string, current?: string) {
+    checkCancelled(this.signal);
     this.progress({ task: 'spaces', phase, done: this.done, total: this.total, current,
       ...(phase === 'Done' ? { warning: this.partial ? 'Space Map is partial: unreadable paths or the scan limit prevented a complete measurement.' : '' } : {}) });
   }
@@ -142,6 +144,7 @@ async function measure(scan: Scan, dir: string, opts: MeasureOpts): Promise<Spac
   const prefix = dir.length + (dir.endsWith(path.sep) ? 0 : 1);
 
   const stats = await walk(dir, {
+    signal: scan.signal,
     maxEntries: scan.budget,
     skipDir: (p) => (!!opts.exclude && samePath(p, opts.exclude)) || !!opts.skip?.(p),
     onDir: (p, depth) => {
@@ -163,6 +166,7 @@ async function measure(scan: Scan, dir: string, opts: MeasureOpts): Promise<Spac
     onTick: (_n, current) => scan.tick(phase, current),
   });
   scan.budget -= stats.files + stats.dirs;
+  checkCancelled(scan.signal);
   if (incompleteWalk(stats)) scan.partial = true;
   scan.done++;
   if (stats.bytes <= 0) return null;
@@ -372,8 +376,9 @@ async function scanDrive(scan: Scan, disk: DiskInfo): Promise<SpaceNode> {
 }
 
 /** Breaks down the home folder (root undefined) or a whole fixed drive by size, two levels deep. */
-export async function scanSpaces(progress: Progress, root?: unknown): Promise<SpaceNode> {
-  const scan = new Scan(progress);
+export async function scanSpaces(progress: Progress, root?: unknown, signal?: AbortSignal): Promise<SpaceNode> {
+  checkCancelled(signal);
+  const scan = new Scan(progress, signal);
   if (root === undefined || root === null) return scanHome(scan);
   if (typeof root !== 'string' || root.length === 0 || root.length > 260 || root.includes('\0')) {
     throw new Error('That drive is not available');

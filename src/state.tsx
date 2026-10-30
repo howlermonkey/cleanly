@@ -8,6 +8,8 @@ import type {
   Settings,
   SpaceNode,
   SystemInfo,
+  ScanSummary,
+  ScanTask,
 } from '../shared/types';
 import { api } from './api';
 import { sum } from './lib/format';
@@ -51,6 +53,8 @@ interface Store {
   progress: ScanProgress | null;
   lastScanAt: number | null;
   scanWarnings: Record<string, string>;
+  scanSummaries: Partial<Record<ScanTask, ScanSummary>>;
+  activeScans: ScanTask[];
 
   cleaning: boolean;
   lastClean: CleanResult | null;
@@ -87,12 +91,15 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [progress, setProgress] = useState<ScanProgress | null>(null);
   const [lastScanAt, setLastScanAt] = useState<number | null>(null);
   const [scanWarnings, setScanWarnings] = useState<Record<string, string>>({});
+  const [scanSummaries, setScanSummaries] = useState<Partial<Record<ScanTask, ScanSummary>>>({});
+  const [activeScans, setActiveScans] = useState<ScanTask[]>([]);
   const [cleaning, setCleaning] = useState(false);
   const [lastClean, setLastClean] = useState<CleanResult | null>(null);
   const [cleanPulse, setCleanPulse] = useState(0);
   const [lastCleanAt, setLastCleanAt] = useState<number | null>(null);
   const [toasts, setToasts] = useState<Toast[]>([]);
   const scanRef = useRef<Promise<void> | null>(null);
+  const junkCancelled = useRef(false);
   const spacesRef = useRef(new Map<string, Promise<void>>());
 
   const toast = useCallback((text: string, kind: Toast['kind'] = 'ok') => {
@@ -150,7 +157,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         setJunk(j);
         setLastScanAt(Date.now());
         // the space map walks the whole home folder; let it finish in the background
-        void scanSpaces();
+        if (!junkCancelled.current) void scanSpaces();
       } catch (e) {
         toast(e instanceof Error ? e.message : 'Scan failed', 'err');
       } finally {
@@ -198,7 +205,11 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     const off = api.onProgress(p => {
       setProgress(p);
+      if (p.task === 'junk' && p.running === true) junkCancelled.current = false;
+      if (p.task === 'junk' && p.summary) junkCancelled.current = p.summary.cancelled;
       if (p.warning !== undefined) setScanWarnings(w => ({ ...w, [p.task]: p.warning! }));
+      if (p.summary) setScanSummaries(s => ({ ...s, [p.task]: p.summary }));
+      if (p.running !== undefined) setActiveScans(s => p.running ? [...new Set([...s, p.task as ScanTask])] : s.filter(t => t !== p.task));
     });
     api.system().then(setSystem).catch(() => undefined);
     api.getSettings().then(setSettingsState).catch(() => undefined);
@@ -231,6 +242,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     progress,
     lastScanAt,
     scanWarnings,
+    scanSummaries,
+    activeScans,
     cleaning,
     lastClean,
     cleanPulse,

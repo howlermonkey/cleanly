@@ -1,6 +1,6 @@
 import './boot';
 import { assertDestructiveFeaturesEnabled } from '../shared/safety';
-import { app, BrowserWindow, ipcMain, nativeTheme, shell } from 'electron';
+import { app, BrowserWindow, ipcMain, nativeTheme, shell, dialog } from 'electron';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -11,6 +11,7 @@ import {
   type CleanlyApi,
   type ScanProgress,
   type SystemInfo,
+  type ScanTask,
 } from '../shared/types';
 import { askAi } from './services/ai';
 import { listApps, uninstallApp } from './services/apps';
@@ -19,7 +20,10 @@ import { getFileIcons } from './services/icons';
 import { scanDuplicates } from './services/duplicates';
 import { sendFeedback } from './services/feedback';
 import { cleanJunk, scanJunk, previewJunk } from './services/junk';
-import { previewTrash, previewDuplicates, executePlan } from './services/plans';
+import { previewTrash, previewDuplicates, executePlan, revisePlan } from './services/plans';
+import { ScanJobs } from './services/scanJobs';
+import { discoveryOptions, validScanRoot } from './services/discovery';
+import { assertNoLinks } from './services/pathSafety';
 import { mutations } from './services/mutations';
 import { scanLargeFiles } from './services/largeFiles';
 import { getProtection } from './services/protection';
@@ -35,6 +39,12 @@ const devServer = process.env.VITE_DEV_SERVER_URL;
 let win: BrowserWindow | null = null;
 
 const progress = (p: ScanProgress) => win?.webContents.send(PROGRESS_CHANNEL, p);
+const scanJobs = new ScanJobs();
+const runScan = <T>(task: ScanTask, work: (signal: AbortSignal) => Promise<T>) => scanJobs.run(task, async signal => {
+  progress({ task, phase: 'Starting', done: 0, total: 0, running: true, warning: '' });
+  try { return await work(signal); }
+  finally { progress({ task, phase: signal.aborted ? 'Cancelled' : 'Finished', done: 0, total: 0, running: false }); }
+});
 
 function systemInfo(): SystemInfo {
   const platform = process.platform === 'darwin' || process.platform === 'win32' ? process.platform : 'linux';
@@ -89,15 +99,25 @@ const handlers: Handlers = {
   disk: () => getDisk(),
   disks: () => listDisks(),
   fileIcons: (paths) => getFileIcons(paths),
-  scanJunk: () => scanJunk(progress),
-  previewJunk,
-  previewTrash,
-  previewDuplicates,
+  scanJunk: () => runScan('junk', async signal => scanJunk(progress, (await getSettings()).excludedPaths, signal)),
+  previewJunk: (ids, cursor) => runScan('preview', async signal => previewJunk(ids, cursor, (await getSettings()).excludedPaths, signal)),
+  revisePlan: (id, paths) => runScan('preview', signal => revisePlan(id, paths, signal)),
+  cancelScan: async task => scanJobs.cancel(task),
+  chooseFolder: async () => {
+    const result = await dialog.showOpenDialog({ title: 'Choose a folder for discovery', properties: ['openDirectory'] });
+    if (result.canceled || !result.filePaths.length) return null;
+    const folder = result.filePaths[0];
+    if (!validScanRoot(folder)) throw new Error('Choose an ordinary local folder, not a system, home or drive root');
+    await assertNoLinks(folder);
+    return folder;
+  },
+  previewTrash: paths => runScan('preview', signal => previewTrash(paths, signal)),
+  previewDuplicates: groups => runScan('preview', signal => previewDuplicates(groups, signal)),
   executePlan,
   cleanJunk: (ids) => cleanJunk(ids, progress),
-  scanSpaces: (root) => scanSpaces(progress, root),
-  scanLargeFiles: (minBytes) => scanLargeFiles(minBytes, progress),
-  scanDuplicates: () => scanDuplicates(progress),
+  scanSpaces: (root) => runScan('spaces', signal => scanSpaces(progress, root, signal)),
+  scanLargeFiles: (minBytes) => runScan('large', async signal => scanLargeFiles(minBytes, progress, discoveryOptions(await getSettings()), signal)),
+  scanDuplicates: () => runScan('dupes', async signal => scanDuplicates(progress, discoveryOptions(await getSettings()), signal)),
   trashPaths: (paths) => trashPaths(paths),
   revealPath: async (p) => {
     shell.showItemInFolder(revealablePath(p));

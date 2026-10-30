@@ -3,10 +3,13 @@ import { assertDestructiveFeaturesEnabled } from '../../shared/safety';
 import { promises as fsp, type Dirent } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import type { CleanResult, IconName, JunkCategory, ScanProgress } from '../../shared/types';
+import type { CleanResult, IconName, JunkCategory, ScanProgress, ScanSummary } from '../../shared/types';
 import { isSafeUserPath } from './trash';
 import { assertNoLinks } from './pathSafety';
-import { plannedItem, removalPlans, type PlannedItem } from './plans';
+import { excluded as excludedPath } from './discovery';
+import { isInside } from './pathSafety';
+import { checkCancelled } from './scanJobs';
+import { startCleanupBatches, nextCleanupBatch, type CleanupCandidate } from './cleanupBatches';
 import type { RemovalPlan } from '../../shared/types';
 import {
   DAY_MS,
@@ -398,21 +401,26 @@ interface Measured {
 }
 
 /** Sizes what a clean would remove: every entry inside each root, minus excluded and too-fresh files. */
-async function measureCache(def: Def, roots: Root[], onTick: (current: string) => void): Promise<Measured> {
+async function measureCache(def: Def, roots: Root[], onTick: (current: string) => void, exclusions: string[], signal?: AbortSignal, summary?: ScanSummary): Promise<Measured> {
   const cutoff = def.keepNewerThanMs ? Date.now() - def.keepNewerThanMs : undefined;
   const out: Measured = { size: 0, count: 0, locations: [] };
   for (const root of roots) {
+    checkCancelled(signal);
+    if (excludedPath(root.path, exclusions)) continue;
+    summary?.roots.push(root.path);
     const excluded = new Set((root.exclude ?? []).map(lower));
     const entries = new Set<string>();
     let bytes = 0;
     const top = (p: string) => lower(path.relative(root.path, p).split(path.sep)[0]);
     const stats = await walk(root.path, {
       maxEntries: SCAN_CAP,
-      skipDir: (_p, name, depth) => depth === 1 && excluded.has(lower(name)),
+      signal,
+      skipDir: (p, name, depth) => excludedPath(p, exclusions) || (depth === 1 && excluded.has(lower(name))),
       onDir: (p, depth) => {
         if (depth === 1 && cutoff === undefined) entries.add(top(p));
       },
       onFile: (f) => {
+        if (excludedPath(f.path, exclusions)) { if (summary) summary.skipped++; return; }
         if (f.depth === 1 && excluded.has(lower(f.name))) return;
         // Same freshness rule as deleteCacheEntry, so the size shown matches what a clean removes.
         if (cutoff !== undefined && newest(f) >= cutoff) return;
@@ -421,6 +429,7 @@ async function measureCache(def: Def, roots: Root[], onTick: (current: string) =
       },
       onTick: (_n, current) => onTick(current),
     });
+    if (summary) { summary.visited += stats.files + stats.dirs; summary.unreadable += stats.unreadable; summary.skipped += stats.linked; summary.limited ||= stats.truncated; }
     if (incompleteWalk(stats)) throw new Error('Incomplete scan: unreadable, linked or limited cache entries');
     if (bytes > 0) {
       out.size += bytes;
@@ -436,7 +445,7 @@ const touched = (f: { mtimeMs: number; birthtimeMs: number; atimeMs: number }) =
   Math.max(f.mtimeMs, f.birthtimeMs || 0, f.atimeMs || 0);
 
 /** Top-level entries of Downloads whose content was all last touched 90+ days ago. */
-export async function findOldDownloads(): Promise<{ paths: string[]; size: number; folder: string; incomplete: boolean }> {
+export async function findOldDownloads(exclusions: string[] = [], signal?: AbortSignal): Promise<{ paths: string[]; size: number; folder: string; incomplete: boolean }> {
   const folder = knownFolder('downloads');
   const cutoff = Date.now() - OLD_DOWNLOAD_MS;
   const result = { paths: [] as string[], size: 0, folder, incomplete: false };
@@ -450,7 +459,7 @@ export async function findOldDownloads(): Promise<{ paths: string[]; size: numbe
   const candidates = list.filter((d) => !DOWNLOAD_IGNORE.has(lower(d.name)) && (d.isFile() || d.isDirectory()));
   await mapLimit(candidates, 8, async (d) => {
     const p = path.join(folder, d.name);
-    if (!isSafeUserPath(p)) return;
+    if (signal?.aborted || !isSafeUserPath(p) || excludedPath(p, exclusions) || exclusions.some(e => isInside(p, e))) return;
     try {
       const st = await fsp.lstat(p);
       if (st.isSymbolicLink()) return;
@@ -468,7 +477,7 @@ export async function findOldDownloads(): Promise<{ paths: string[]; size: numbe
       const childDirs: string[] = [];
       const stats = await walk(p, {
         onDir: dir => childDirs.push(dir),
-        signal: ctrl.signal,
+        signal: signal ? AbortSignal.any([signal, ctrl.signal]) : ctrl.signal,
         maxEntries: 200_000,
         onFile: (f) => {
           size += f.size;
@@ -529,25 +538,27 @@ async function measureRecycleBin(): Promise<{ count: number; size: number }> {
   }
 }
 
-async function measure(def: Def, onTick: (current: string) => void): Promise<Measured> {
+async function measure(def: Def, onTick: (current: string) => void, exclusions: string[], signal?: AbortSignal, summary?: ScanSummary): Promise<Measured> {
   if (def.kind === 'recycle') {
     const r = await measureRecycleBin();
     return { size: r.size, count: r.count, locations: ['Recycle Bin'] };
   }
   if (def.kind === 'downloads') {
-    const r = await findOldDownloads();
+    const r = await findOldDownloads(exclusions, signal);
     if (r.incomplete) throw new Error('Downloads could not be fully inspected');
     return { size: r.size, count: r.paths.length, locations: r.paths.length ? [displayPath(r.folder)] : [] };
   }
   const roots = (await def.roots?.()) ?? [];
-  return measureCache(def, roots, onTick);
+  return measureCache(def, roots, onTick, exclusions, signal, summary);
 }
 
-export async function scanJunk(progress: Progress): Promise<JunkCategory[]> {
+export async function scanJunk(progress: Progress, exclusions: string[] = [], signal?: AbortSignal): Promise<JunkCategory[]> {
   const defs = platformDefs();
   const found: JunkCategory[] = [];
+  const summary: ScanSummary = { roots: [], visited: 0, skipped: 0, unreadable: 0, matched: 0, limited: false, cancelled: false, notes: [exclusions.length + ' saved exclusions. Cleanup uses known cache locations, not discovery folders. Counts cover inspected cache entries; download age checks are separate.'] };
   const warnings: string[] = [];
   for (let i = 0; i < defs.length; i++) {
+    if (signal?.aborted) break;
     const def = defs[i];
     progress({ task: 'junk', phase: def.name, done: i, total: defs.length });
     let last = 0;
@@ -558,7 +569,7 @@ export async function scanJunk(progress: Progress): Promise<JunkCategory[]> {
       progress({ task: 'junk', phase: def.name, done: i, total: defs.length, current: displayPath(current) });
     };
     try {
-      const m = await measure(def, onTick);
+      const m = await measure(def, onTick, exclusions, signal, summary);
       if (m.size <= 0) continue;
       found.push({
         id: def.id,
@@ -574,50 +585,62 @@ export async function scanJunk(progress: Progress): Promise<JunkCategory[]> {
       warnings.push(`${def.name} could not be fully inspected and was excluded`);
     }
   }
-  progress({ task: 'junk', phase: 'Done', done: defs.length, total: defs.length, warning: warnings.join('; ') });
+  summary.cancelled = Boolean(signal?.aborted); summary.matched = found.length;
+  if (summary.cancelled) warnings.push('Scan cancelled; results are partial');
+  summary.partial = warnings.length > 0;
+  progress({ task: 'junk', phase: summary.cancelled ? 'Cancelled' : 'Done', done: found.length, total: defs.length, summary, warning: warnings.join('; ') });
   return found.sort((a, b) => b.size - a.size);
 }
 
 /** Preview exact leaf files; no directory-wide or Recycle Bin erasure. */
-export async function previewJunk(ids: unknown): Promise<RemovalPlan> {
-  if (!Array.isArray(ids) || ids.length > 40 || ids.some(id => typeof id !== 'string')) throw new Error('Invalid categories');
+export async function previewJunk(ids: unknown, cursor?: string, exclusions: string[] = [], signal?: AbortSignal): Promise<RemovalPlan> {
+  if (!Array.isArray(ids) || !ids.length || ids.length > 40 || ids.some(id => typeof id !== 'string')) throw new Error('Invalid categories');
+  const selected = [...new Set(ids as string[])].sort();
   const defs = platformDefs();
-  if (ids.some(id => !defs.some(d => d.id === id))) throw new Error('Unsupported cleanup category');
-  const items: PlannedItem[] = [];
+  if (selected.some(id => !defs.some(d => d.id === id))) throw new Error('Unsupported cleanup category');
+  if (cursor !== undefined) return nextCleanupBatch(cursor, selected, exclusions, signal);
+  const candidates: CleanupCandidate[] = [];
   const seen = new Set<string>();
-  for (const def of defs.filter(d => ids.includes(d.id))) {
+  let limited = false;
+  for (const def of defs.filter(d => selected.includes(d.id))) {
+    checkCancelled(signal);
     if (def.kind === 'downloads') {
-      const result = await findOldDownloads();
+      const result = await findOldDownloads(exclusions, signal);
+      checkCancelled(signal);
       if (result.incomplete) throw new Error('Downloads preview is incomplete');
-      for (const p of result.paths) items.push(await plannedItem(p, 'trash'));
+      for (const p of result.paths) {
+        if (candidates.length >= 100_000) { limited = true; break; }
+        candidates.push({ path: p, action: 'trash' });
+      }
       continue;
     }
     for (const root of await def.roots?.() ?? []) {
+      checkCancelled(signal);
+      if (excludedPath(root.path, exclusions)) continue;
       await assertNoLinks(root.path);
-      const files: string[] = [];
+      const stop = new AbortController();
       const cutoff = def.keepNewerThanMs ? Date.now() - def.keepNewerThanMs : undefined;
-      const excluded = new Set((root.exclude ?? []).map(lower));
+      const names = new Set((root.exclude ?? []).map(lower));
       const stats = await walk(root.path, {
-        maxEntries: 10_000,
-        skipDir: (_p, name, depth) => depth === 1 && excluded.has(lower(name)),
+        maxEntries: SCAN_CAP,
+        signal: signal ? AbortSignal.any([signal, stop.signal]) : stop.signal,
+        skipDir: (p, name, depth) => excludedPath(p, exclusions) || (depth === 1 && names.has(lower(name))),
         onFile: f => {
-          if (f.depth === 1 && excluded.has(lower(f.name))) return;
-          if (cutoff !== undefined && newest(f) >= cutoff) return;
-          files.push(f.path);
+          if (excludedPath(f.path, exclusions) || (f.depth === 1 && names.has(lower(f.name))) || (cutoff !== undefined && newest(f) >= cutoff) || seen.has(f.path)) return;
+          if (candidates.length >= 100_000) { limited = true; stop.abort(); return; }
+          seen.add(f.path); candidates.push({ path: f.path, action: 'delete', cutoff });
         },
       });
-      if (incompleteWalk(stats)) throw new Error('Cleanup preview is incomplete; nothing will be removed');
-      for (const p of files) {
-        if (seen.has(p)) continue;
-        seen.add(p);
-        const item = await plannedItem(p, 'delete');
-        if (cutoff !== undefined && newest(await fsp.lstat(p)) >= cutoff) throw new Error('A temporary file changed; preview again');
-        items.push(item);
-        if (items.length > 10_000) throw new Error('Preview limit reached; select fewer categories');
-      }
+      checkCancelled(signal);
+      limited ||= stats.truncated || stats.unreadable > 0 || stats.linked > 0;
+      // Each batch snapshots only verified leaves. No uninspected subtree is removed.
+      if (candidates.length >= 100_000) break;
     }
+    if (candidates.length >= 100_000) { limited = true; break; }
   }
-  return removalPlans.create(items);
+  checkCancelled(signal);
+  candidates.sort((a,b) => a.path.localeCompare(b.path));
+  return nextCleanupBatch(startCleanupBatches(candidates, selected, limited), selected, exclusions, signal);
 }
 
 /** Raw category execution is retired; execution requires a preview token. */
